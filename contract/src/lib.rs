@@ -1,9 +1,8 @@
 use near_sdk::borsh::{BorshDeserialize, BorshSerialize};
 use near_sdk::collections::LookupMap;
 use near_sdk::json_types::U128;
-use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::{
-    env, log, near, near_bindgen, AccountId, BorshStorageKey, CryptoHash, NearToken,
+    env, log, near, near_bindgen, AccountId, BorshStorageKey, NearToken,
     PanicOnDefault, Promise,
 };
 
@@ -103,16 +102,6 @@ impl Intent {
         self.proposers.contains(account)
     }
 
-    fn approver_index(&self, account: &AccountId) -> Option<usize> {
-        self.approvers.iter().position(|a| a == account)
-    }
-
-    fn effective_approver(&self, index: usize, delegations: &LookupMap<String, AccountId>) -> AccountId {
-        let original = &self.approvers[index];
-        let key = format!("{}:{}:{}", self.wallet_name, self.index, index);
-        delegations.get(&key).unwrap_or_else(|| original.clone())
-    }
-
     fn execution_gas(&self) -> near_sdk::Gas {
         let tgas = if self.execution_gas_tgas == 0 {
             DEFAULT_EXECUTION_GAS_TGAS
@@ -143,19 +132,10 @@ impl Intent {
                 },
                 None => continue,
             };
+            // Sanitize: reject message format characters to prevent injection
             assert!(
-                !value.contains('|'),
-                "Param '{}' contains illegal character '|'",
-                param.name
-            );
-            assert!(
-                !value.contains('\n'),
-                "Param '{}' contains newline",
-                param.name
-            );
-            assert!(
-                !value.contains('\r'),
-                "Param '{}' contains carriage return",
+                !value.contains('|') && !value.contains('\n') && !value.contains('\r'),
+                "Param '{}' contains illegal characters",
                 param.name
             );
             result = result.replace(&placeholder, &value);
@@ -209,7 +189,6 @@ impl Proposal {
         self.cancellation_bitmap |= mask;
     }
 
-    /// Reset all approvals and cancellations (for amendment).
     fn reset_votes(&mut self) {
         self.approval_bitmap = 0;
         self.cancellation_bitmap = 0;
@@ -227,12 +206,8 @@ pub struct Wallet {
     pub created_at: u64,
     /// Amount of NEAR deposited for storage (yoctoNEAR)
     pub storage_deposit: u128,
-}
-
-impl Wallet {
-    fn is_active(&self) -> bool {
-        !self.name.is_empty()
-    }
+    /// Actual storage used (bytes), tracked for accurate refunds
+    pub storage_used: u64,
 }
 
 // ── Composite keys ─────────────────────────────────────────────────────────
@@ -265,7 +240,7 @@ fn assert_direct_call() {
     assert_eq!(
         env::signer_account_id(),
         env::predecessor_account_id(),
-        "Direct call required (no cross-contract calls)"
+        "ERR_DIRECT_CALL_REQUIRED"
     );
 }
 
@@ -276,6 +251,16 @@ fn signer_pk_hex() -> String {
     // near-sdk PublicKey: 1-byte curve type prefix (0x00 = ed25519) + 32 bytes key
     let raw = if bytes.len() == 33 { &bytes[1..] } else { &bytes[..] };
     hex_encode(raw)
+}
+
+/// Build a JSON string safely using serde_json (no string formatting for JSON).
+fn safe_json_ft_transfer(recipient: &str, amount: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "receiver_id": recipient,
+        "amount": amount,
+        "msg": ""
+    }))
+    .unwrap_or_else(|_| env::panic_str("ERR_JSON_SERIALIZE"))
 }
 
 // ── Contract ───────────────────────────────────────────────────────────────
@@ -306,26 +291,26 @@ impl Contract {
 
     // ── Wallet Management ──────────────────────────────────────────────
 
-    /// Create a new wallet. Requires 0.5 NEAR storage deposit.
     #[payable]
     pub fn create_wallet(&mut self, name: String) {
         let deposit = env::attached_deposit();
         assert!(
             deposit.as_yoctonear() >= STORAGE_DEPOSIT_YOCTO,
-            "Insufficient storage deposit: need {} yoctoNEAR, got {}",
+            "ERR_STORAGE_DEPOSIT: need {} yoctoNEAR, got {}",
             STORAGE_DEPOSIT_YOCTO,
             deposit.as_yoctonear()
         );
 
         let predecessor = env::predecessor_account_id();
-        assert!(self.wallets.get(&name).is_none(), "Wallet already exists");
-        assert!(!name.is_empty(), "Name cannot be empty");
-        assert!(name.len() <= 64, "Name too long (max 64 chars)");
+        assert!(self.wallets.get(&name).is_none(), "ERR_WALLET_EXISTS");
+        assert!(!name.is_empty(), "ERR_NAME_EMPTY");
+        assert!(name.len() <= 64, "ERR_NAME_TOO_LONG");
         assert!(
             name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'),
-            "Name must be alphanumeric, hyphens, or underscores"
+            "ERR_NAME_INVALID_CHARS"
         );
 
+        let initial_storage = env::storage_usage();
         let wallet = Wallet {
             name: name.clone(),
             owner: predecessor.clone(),
@@ -333,102 +318,103 @@ impl Contract {
             intent_index: 3,
             created_at: env::block_timestamp(),
             storage_deposit: deposit.as_yoctonear(),
+            storage_used: 0, // will be set after writes
         };
         self.wallets.insert(&name, &wallet);
+        self.create_meta_intents(&name, &predecessor);
+        let storage_used = env::storage_usage() - initial_storage;
 
-        let pk = predecessor.clone();
-        self.create_meta_intents(&name, &pk);
+        // Update with actual storage usage
+        let mut w = self.wallets.get(&name).unwrap();
+        w.storage_used = storage_used;
+        self.wallets.insert(&name, &w);
 
         self.emit("wallet_created", serde_json::json!({
             "wallet": name,
-            "owner": pk.to_string(),
+            "owner": predecessor.to_string(),
             "deposit": deposit.as_yoctonear().to_string(),
+            "storage_used": storage_used,
         }));
 
-        log!("Wallet '{}' created", name);
+        log!("Wallet '{}' created ({} bytes storage)", name, storage_used);
     }
 
-    /// Delete a wallet. Only owner, no active proposals. Refunds storage deposit.
     pub fn delete_wallet(&mut self, name: String) {
         assert_direct_call();
-        let wallet = self.wallets.get(&name).expect("Wallet not found");
+        let wallet = self.wallets.get(&name).expect("ERR_WALLET_NOT_FOUND");
         assert_eq!(
             env::predecessor_account_id(),
             wallet.owner,
-            "Only owner can delete"
+            "ERR_NOT_OWNER"
         );
 
-        // Verify no active proposals exist
         for i in 0..wallet.intent_index {
             if let Some(intent) = self.intents.get(&intent_key(&name, i)) {
                 assert!(
                     intent.active_proposal_count == 0,
-                    "Cannot delete wallet with active proposals (intent #{} has {})",
+                    "ERR_ACTIVE_PROPOSALS: intent #{} has {}",
                     i,
                     intent.active_proposal_count
                 );
             }
         }
 
-        // Clean up all intents
-        for i in 0..wallet.intent_index {
-            self.intents.remove(&intent_key(&name, i));
-        }
-
-        // Clean up all proposals
-        for i in 0..wallet.proposal_index {
-            self.proposals.remove(&proposal_key(&name, i));
-        }
-
-        // Clean up delegations
+        // Collect delegation keys before removing intents
+        let mut del_keys: Vec<String> = Vec::new();
         for i in 0..wallet.intent_index {
             if let Some(intent) = self.intents.get(&intent_key(&name, i)) {
                 for j in 0..intent.approvers.len() {
-                    let dkey = delegation_key(&name, i, j);
-                    self.delegations.remove(&dkey);
+                    del_keys.push(delegation_key(&name, i, j));
                 }
             }
         }
 
-        // Refund storage deposit to owner
-        let refund = NearToken::from_yoctonear(wallet.storage_deposit);
-        Promise::new(wallet.owner.clone()).transfer(refund);
+        for i in 0..wallet.intent_index {
+            self.intents.remove(&intent_key(&name, i));
+        }
+        for i in 0..wallet.proposal_index {
+            self.proposals.remove(&proposal_key(&name, i));
+        }
+        for dkey in del_keys {
+            self.delegations.remove(&dkey);
+        }
 
-        // Remove wallet last
+        // Refund only the actual storage cost (20 yoctoNEAR per byte) + deposit remainder
+        let storage_cost = NearToken::from_yoctonear(wallet.storage_used as u128)
+    .saturating_mul(env::storage_byte_cost().as_yoctonear())
+    .as_yoctonear();
+        let refund = wallet.storage_deposit.saturating_sub(storage_cost);
+        if refund > 0 {
+            Promise::new(wallet.owner.clone()).transfer(NearToken::from_yoctonear(refund));
+        }
+
         self.wallets.remove(&name);
 
         self.emit("wallet_deleted", serde_json::json!({
             "wallet": name,
-            "refund": wallet.storage_deposit.to_string(),
+            "storage_used": wallet.storage_used,
+            "refund": refund.to_string(),
         }));
 
-        log!("Wallet '{}' deleted", name);
+        log!("Wallet '{}' deleted (refunded {} yocto)", name, refund);
     }
 
-    /// Transfer ownership to a new account. Owner only.
     pub fn transfer_ownership(&mut self, wallet_name: String, new_owner: AccountId) {
         assert_direct_call();
-        let mut wallet = self.wallets.get(&wallet_name).expect("Wallet not found");
-        assert_eq!(
-            env::predecessor_account_id(),
-            wallet.owner,
-            "Only owner can transfer ownership"
-        );
-        assert_ne!(new_owner, wallet.owner, "Already the owner");
+        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        assert_eq!(env::predecessor_account_id(), wallet.owner, "ERR_NOT_OWNER");
+        assert_ne!(new_owner, wallet.owner, "ERR_ALREADY_OWNER");
 
         let old_owner = wallet.owner.clone();
         wallet.owner = new_owner.clone();
         self.wallets.insert(&wallet_name, &wallet);
 
-        // Update meta-intent proposers/approvers to include new owner
         for i in 0..3u32 {
             let ikey = intent_key(&wallet_name, i);
             if let Some(mut intent) = self.intents.get(&ikey) {
-                // Replace old owner with new owner in proposers
                 if let Some(pos) = intent.proposers.iter().position(|a| a == &old_owner) {
                     intent.proposers[pos] = new_owner.clone();
                 }
-                // Replace in approvers
                 if let Some(pos) = intent.approvers.iter().position(|a| a == &old_owner) {
                     intent.approvers[pos] = new_owner.clone();
                 }
@@ -447,19 +433,12 @@ impl Contract {
 
     // ── Intent Management ──────────────────────────────────────────────
 
-    /// Add a custom intent. Owner only (for bootstrapping).
-    /// For production, use AddIntent meta-intent proposals.
     pub fn add_intent(&mut self, wallet_name: String, intent: Intent) {
-        let mut wallet = self.wallets.get(&wallet_name).expect("Wallet not found");
-        assert_eq!(
-            env::predecessor_account_id(),
-            wallet.owner,
-            "Only owner can add intents directly"
-        );
+        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        assert_eq!(env::predecessor_account_id(), wallet.owner, "ERR_NOT_OWNER");
         self.validate_intent(&intent);
 
         let index = wallet.intent_index;
-        let key = intent_key(&wallet_name, index);
         let mut i = intent;
         i.wallet_name = wallet_name.clone();
         i.index = index;
@@ -468,7 +447,7 @@ impl Contract {
         if i.execution_gas_tgas == 0 {
             i.execution_gas_tgas = DEFAULT_EXECUTION_GAS_TGAS;
         }
-        self.intents.insert(&key, &i);
+        self.intents.insert(&intent_key(&wallet_name, index), &i);
 
         wallet.intent_index = index + 1;
         self.wallets.insert(&wallet_name, &wallet);
@@ -482,9 +461,6 @@ impl Contract {
         log!("Intent #{} added to '{}'", index, wallet_name);
     }
 
-    /// Delegate your approver slot to another account.
-    /// The delegate can approve/cancel on your behalf.
-    /// Pass your own account to revoke delegation.
     pub fn delegate_approver(
         &mut self,
         wallet_name: String,
@@ -495,42 +471,28 @@ impl Contract {
         assert_direct_call();
         let caller = env::predecessor_account_id();
 
-        let ikey = intent_key(&wallet_name, intent_index);
-        let intent = self.intents.get(&ikey).expect("Intent not found");
-        assert!(
-            (approver_index as usize) < intent.approvers.len(),
-            "Invalid approver index"
-        );
-        assert_eq!(
-            intent.approvers[approver_index as usize],
-            caller,
-            "Not your approver slot"
-        );
+        let intent = self.intents.get(&intent_key(&wallet_name, intent_index)).expect("ERR_INTENT_NOT_FOUND");
+        assert!((approver_index as usize) < intent.approvers.len(), "ERR_INVALID_APPROVER_INDEX");
+        assert_eq!(intent.approvers[approver_index as usize], caller, "ERR_NOT_YOUR_SLOT");
 
         let dkey = delegation_key(&wallet_name, intent_index, approver_index as usize);
 
         if delegate == caller {
-            // Revoke delegation
             self.delegations.remove(&dkey);
             self.emit("delegation_revoked", serde_json::json!({
-                "wallet": wallet_name,
-                "intent_index": intent_index,
-                "approver_index": approver_index,
+                "wallet": wallet_name, "intent_index": intent_index, "approver_index": approver_index,
             }));
         } else {
             self.delegations.insert(&dkey, &delegate);
             self.emit("delegation_set", serde_json::json!({
-                "wallet": wallet_name,
-                "intent_index": intent_index,
-                "approver_index": approver_index,
-                "delegate": delegate.to_string(),
+                "wallet": wallet_name, "intent_index": intent_index,
+                "approver_index": approver_index, "delegate": delegate.to_string(),
             }));
         }
     }
 
     // ── Proposal Lifecycle ─────────────────────────────────────────────
 
-    /// Create a proposal with a clear-signed message.
     pub fn propose(
         &mut self,
         wallet_name: String,
@@ -543,38 +505,24 @@ impl Contract {
         assert_direct_call();
 
         let proposer = env::predecessor_account_id();
-        let mut wallet = self.wallets.get(&wallet_name).expect("Wallet not found");
+        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         let ikey = intent_key(&wallet_name, intent_index);
-        let intent = self.intents.get(&ikey).expect("Intent not found");
+        let intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
 
-        assert!(intent.active, "Intent inactive");
-        assert!(
-            intent.is_proposer(&proposer) || proposer == wallet.owner,
-            "Not a proposer"
-        );
-        assert!(expires_at > env::block_timestamp(), "Must expire in future");
-        assert!(
-            expires_at <= env::block_timestamp() + MAX_EXPIRY_NS,
-            "Expiry too far in future (max 1 year)"
-        );
-        assert!(
-            intent.active_proposal_count < MAX_ACTIVE_PROPOSALS,
-            "Max active proposals reached ({})",
-            MAX_ACTIVE_PROPOSALS
-        );
+        assert!(intent.active, "ERR_INTENT_INACTIVE");
+        assert!(intent.is_proposer(&proposer) || proposer == wallet.owner, "ERR_NOT_PROPOSER");
+        assert!(expires_at > env::block_timestamp(), "ERR_EXPIRED");
+        assert!(expires_at <= env::block_timestamp() + MAX_EXPIRY_NS, "ERR_EXPIRY_TOO_FAR");
+        assert!(intent.active_proposal_count < MAX_ACTIVE_PROPOSALS, "ERR_MAX_PROPOSALS");
 
-        let params: serde_json::Value =
-            serde_json::from_str(&param_values).expect("Invalid JSON");
+        let params: serde_json::Value = serde_json::from_str(&param_values).expect("ERR_INVALID_JSON");
         self.validate_params(&intent, &params);
 
         let proposal_index = wallet.proposal_index;
-        let msg = message::build_message(
-            &wallet_name, proposal_index, expires_at, "propose", &intent, &params,
-        );
+        let msg = message::build_message(&wallet_name, proposal_index, expires_at, "propose", &intent, &params);
 
-        // Verify signature
         message::verify_signature(&proposer_pubkey, &signature, &msg);
-        assert_eq!(proposer_pubkey, signer_pk_hex(), "Signer pubkey mismatch");
+        assert_eq!(proposer_pubkey, signer_pk_hex(), "ERR_PK_MISMATCH");
 
         let proposal = Proposal {
             id: proposal_index,
@@ -592,10 +540,8 @@ impl Contract {
             intent_params_hash: hash_params(&intent.params),
         };
 
-        self.proposals
-            .insert(&proposal_key(&wallet_name, proposal_index), &proposal);
+        self.proposals.insert(&proposal_key(&wallet_name, proposal_index), &proposal);
 
-        // Increment active proposal count
         let mut intent_mut = intent.clone();
         intent_mut.active_proposal_count += 1;
         self.intents.insert(&ikey, &intent_mut);
@@ -604,18 +550,13 @@ impl Contract {
         self.wallets.insert(&wallet_name, &wallet);
 
         self.emit("proposal_created", serde_json::json!({
-            "wallet": wallet_name,
-            "proposal_id": proposal_index,
-            "intent_index": intent_index,
-            "proposer": proposer.to_string(),
-            "message": msg,
+            "wallet": wallet_name, "proposal_id": proposal_index,
+            "intent_index": intent_index, "proposer": proposer.to_string(), "message": msg,
         }));
 
         log!("Proposal #{} created for intent #{}", proposal_index, intent_index);
     }
 
-    /// Amend an active proposal. Only the original proposer can amend.
-    /// Resets all approvals and cancellations.
     pub fn amend_proposal(
         &mut self,
         wallet_name: String,
@@ -629,32 +570,25 @@ impl Contract {
 
         let caller = env::predecessor_account_id();
         let pkey = proposal_key(&wallet_name, proposal_id);
-        let mut proposal = self.proposals.get(&pkey).expect("Proposal not found");
+        let mut proposal = self.proposals.get(&pkey).expect("ERR_PROPOSAL_NOT_FOUND");
 
-        assert_eq!(proposal.proposer, caller, "Only original proposer can amend");
-        assert!(proposal.status == ProposalStatus::Active, "Only active proposals can be amended");
-        assert!(expires_at > env::block_timestamp(), "Must expire in future");
-        assert!(
-            expires_at <= env::block_timestamp() + MAX_EXPIRY_NS,
-            "Expiry too far in future (max 1 year)"
-        );
+        assert_eq!(proposal.proposer, caller, "ERR_NOT_PROPOSER");
+        assert!(proposal.status == ProposalStatus::Active, "ERR_NOT_ACTIVE");
+        assert!(expires_at > env::block_timestamp(), "ERR_EXPIRED");
+        assert!(expires_at <= env::block_timestamp() + MAX_EXPIRY_NS, "ERR_EXPIRY_TOO_FAR");
 
         let ikey = intent_key(&wallet_name, proposal.intent_index);
-        let intent = self.intents.get(&ikey).expect("Intent not found");
+        let intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
+        assert!(intent.active, "ERR_INTENT_INACTIVE");
 
-        let params: serde_json::Value =
-            serde_json::from_str(&param_values).expect("Invalid JSON");
+        let params: serde_json::Value = serde_json::from_str(&param_values).expect("ERR_INVALID_JSON");
         self.validate_params(&intent, &params);
 
-        // Build new message with action "amend"
-        let msg = message::build_message(
-            &wallet_name, proposal_id, expires_at, "amend", &intent, &params,
-        );
+        let msg = message::build_message(&wallet_name, proposal_id, expires_at, "amend", &intent, &params);
 
         message::verify_signature(&proposer_pubkey, &signature, &msg);
-        assert_eq!(proposer_pubkey, signer_pk_hex(), "Signer pubkey mismatch");
+        assert_eq!(proposer_pubkey, signer_pk_hex(), "ERR_PK_MISMATCH");
 
-        // Reset all votes
         proposal.reset_votes();
         proposal.param_values = param_values;
         proposal.expires_at = expires_at;
@@ -664,16 +598,12 @@ impl Contract {
         self.proposals.insert(&pkey, &proposal);
 
         self.emit("proposal_amended", serde_json::json!({
-            "wallet": wallet_name,
-            "proposal_id": proposal_id,
-            "proposer": caller.to_string(),
+            "wallet": wallet_name, "proposal_id": proposal_id, "proposer": caller.to_string(),
         }));
 
         log!("Proposal #{} amended", proposal_id);
     }
 
-    /// Approve a proposal with a clear-signed message.
-    /// Supports both direct approvers and their delegates.
     pub fn approve(
         &mut self,
         wallet_name: String,
@@ -683,66 +613,9 @@ impl Contract {
         expires_at: u64,
     ) {
         assert_direct_call();
-
-        let caller = env::predecessor_account_id();
-        let pkey = proposal_key(&wallet_name, proposal_id);
-        let mut proposal = self.proposals.get(&pkey).expect("Proposal not found");
-
-        assert!(proposal.status == ProposalStatus::Active, "Not active");
-        assert!(proposal.expires_at > env::block_timestamp(), "Proposal expired");
-        assert!(expires_at > env::block_timestamp(), "Signature expired");
-
-        let ikey = intent_key(&wallet_name, proposal.intent_index);
-        let intent = self.intents.get(&ikey).expect("Intent not found");
-        assert!(
-            (approver_index as usize) < intent.approvers.len(),
-            "Invalid approver index"
-        );
-
-        // Check if caller is the direct approver OR a valid delegate
-        let original_approver = &intent.approvers[approver_index as usize];
-        let dkey = delegation_key(&wallet_name, proposal.intent_index, approver_index as usize);
-        let delegate = self.delegations.get(&dkey);
-        let is_direct = caller == *original_approver;
-        let is_delegate = delegate.as_ref() == Some(&caller);
-        assert!(
-            is_direct || is_delegate,
-            "Not the approver or delegate for slot {}",
-            approver_index
-        );
-
-        assert!(
-            !proposal.has_approved(approver_index as usize),
-            "Slot already approved"
-        );
-
-        let params: serde_json::Value =
-            serde_json::from_str(&proposal.param_values).unwrap_or_default();
-        let msg = message::build_message(
-            &wallet_name, proposal_id, expires_at, "approve", &intent, &params,
-        );
-
-        message::verify_signature(&signer_pk_hex(), &signature, &msg);
-
-        proposal.set_approval(approver_index as usize);
-
-        if proposal.approval_count() >= intent.approval_threshold as u32 {
-            proposal.status = ProposalStatus::Approved;
-            proposal.approved_at = env::block_timestamp();
-
-            self.emit("proposal_approved", serde_json::json!({
-                "wallet": wallet_name,
-                "proposal_id": proposal_id,
-                "approval_count": proposal.approval_count(),
-            }));
-
-            log!("Proposal #{} approved", proposal_id);
-        }
-
-        self.proposals.insert(&pkey, &proposal);
+        self.verify_approver(wallet_name.clone(), proposal_id, approver_index, signature, expires_at, "approve");
     }
 
-    /// Cancel-vote a proposal (requires clear-signed message).
     pub fn cancel_vote(
         &mut self,
         wallet_name: String,
@@ -752,55 +625,7 @@ impl Contract {
         expires_at: u64,
     ) {
         assert_direct_call();
-
-        let caller = env::predecessor_account_id();
-        let pkey = proposal_key(&wallet_name, proposal_id);
-        let mut proposal = self.proposals.get(&pkey).expect("Proposal not found");
-
-        assert!(proposal.status == ProposalStatus::Active, "Not active");
-        assert!(proposal.expires_at > env::block_timestamp(), "Proposal expired");
-        assert!(expires_at > env::block_timestamp(), "Signature expired");
-
-        let ikey = intent_key(&wallet_name, proposal.intent_index);
-        let mut intent = self.intents.get(&ikey).expect("Intent not found");
-        assert!(
-            (approver_index as usize) < intent.approvers.len(),
-            "Invalid approver index"
-        );
-
-        // Check delegate
-        let original = &intent.approvers[approver_index as usize];
-        let dkey = delegation_key(&wallet_name, proposal.intent_index, approver_index as usize);
-        let delegate = self.delegations.get(&dkey);
-        assert!(
-            caller == *original || delegate.as_ref() == Some(&caller),
-            "Not the approver or delegate for slot {}",
-            approver_index
-        );
-
-        let params: serde_json::Value =
-            serde_json::from_str(&proposal.param_values).unwrap_or_default();
-        let msg = message::build_message(
-            &wallet_name, proposal_id, expires_at, "cancel", &intent, &params,
-        );
-
-        message::verify_signature(&signer_pk_hex(), &signature, &msg);
-
-        proposal.set_cancellation(approver_index as usize);
-
-        if proposal.cancellation_count() >= intent.cancellation_threshold as u32 {
-            proposal.status = ProposalStatus::Cancelled;
-            intent.active_proposal_count = intent.active_proposal_count.saturating_sub(1);
-            self.intents.insert(&ikey, &intent);
-
-            self.emit("proposal_cancelled", serde_json::json!({
-                "wallet": wallet_name,
-                "proposal_id": proposal_id,
-                "cancellation_count": proposal.cancellation_count(),
-            }));
-        }
-
-        self.proposals.insert(&pkey, &proposal);
+        self.verify_approver(wallet_name.clone(), proposal_id, approver_index, signature, expires_at, "cancel");
     }
 
     // ── Views ──────────────────────────────────────────────────────────
@@ -814,9 +639,7 @@ impl Contract {
     }
 
     pub fn list_intents(&self, wallet_name: String) -> Vec<Intent> {
-        let Some(wallet) = self.wallets.get(&wallet_name) else {
-            return Vec::new();
-        };
+        let Some(wallet) = self.wallets.get(&wallet_name) else { return Vec::new(); };
         (0..wallet.intent_index)
             .filter_map(|i| self.intents.get(&intent_key(&wallet_name, i)))
             .collect()
@@ -827,28 +650,18 @@ impl Contract {
     }
 
     pub fn list_proposals(&self, wallet_name: String) -> Vec<Proposal> {
-        let Some(wallet) = self.wallets.get(&wallet_name) else {
-            return Vec::new();
-        };
+        let Some(wallet) = self.wallets.get(&wallet_name) else { return Vec::new(); };
         (0..wallet.proposal_index)
             .filter_map(|i| self.proposals.get(&proposal_key(&wallet_name, i)))
             .collect()
     }
 
     pub fn get_proposal_message(&self, wallet_name: String, id: u64) -> Option<String> {
-        self.proposals
-            .get(&proposal_key(&wallet_name, id))
-            .map(|p| p.message)
+        self.proposals.get(&proposal_key(&wallet_name, id)).map(|p| p.message)
     }
 
-    pub fn get_delegation(
-        &self,
-        wallet_name: String,
-        intent_index: u32,
-        approver_index: u16,
-    ) -> Option<AccountId> {
-        let dkey = delegation_key(&wallet_name, intent_index, approver_index as usize);
-        self.delegations.get(&dkey)
+    pub fn get_delegation(&self, wallet_name: String, intent_index: u32, approver_index: u16) -> Option<AccountId> {
+        self.delegations.get(&delegation_key(&wallet_name, intent_index, approver_index as usize))
     }
 
     pub fn get_event_nonce(&self) -> u64 {
@@ -861,21 +674,94 @@ impl Contract {
 impl Contract {
     fn emit(&mut self, event: &str, data: serde_json::Value) {
         self.event_nonce += 1;
-        let nonce = self.event_nonce;
         env::log_str(&format!(
             "EVENT_JSON:{}",
             serde_json::json!({
                 "standard": "clear-msig",
                 "version": "1.0.0",
                 "event": event,
-                "nonce": nonce,
+                "nonce": self.event_nonce,
                 "data": data,
             })
         ));
     }
 
+    /// Shared logic for approve and cancel_vote to avoid duplication.
+    fn verify_approver(
+        &mut self,
+        wallet_name: String,
+        proposal_id: u64,
+        approver_index: u16,
+        signature: String,
+        expires_at: u64,
+        action: &str, // "approve" or "cancel"
+    ) {
+        let caller = env::predecessor_account_id();
+        let pkey = proposal_key(&wallet_name, proposal_id);
+        let mut proposal = self.proposals.get(&pkey).expect("ERR_PROPOSAL_NOT_FOUND");
+
+        assert!(proposal.status == ProposalStatus::Active, "ERR_NOT_ACTIVE");
+        assert!(proposal.expires_at > env::block_timestamp(), "ERR_PROPOSAL_EXPIRED");
+        assert!(expires_at > env::block_timestamp(), "ERR_SIG_EXPIRED");
+
+        let ikey = intent_key(&wallet_name, proposal.intent_index);
+        let intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
+        assert!((approver_index as usize) < intent.approvers.len(), "ERR_INVALID_APPROVER_INDEX");
+
+        // Check caller is the approver or their delegate
+        let original = &intent.approvers[approver_index as usize];
+        let dkey = delegation_key(&wallet_name, proposal.intent_index, approver_index as usize);
+        let delegate = self.delegations.get(&dkey);
+        assert!(
+            caller == *original || delegate.as_ref() == Some(&caller),
+            "ERR_NOT_APPROVER_OR_DELEGATE"
+        );
+
+        let params: serde_json::Value = serde_json::from_str(&proposal.param_values).unwrap_or_default();
+        let msg = message::build_message(&wallet_name, proposal_id, expires_at, action, &intent, &params);
+
+        message::verify_signature(&signer_pk_hex(), &signature, &msg);
+
+        match action {
+            "approve" => {
+                assert!(!proposal.has_approved(approver_index as usize), "ERR_ALREADY_APPROVED");
+                proposal.set_approval(approver_index as usize);
+
+                if proposal.approval_count() >= intent.approval_threshold as u32 {
+                    proposal.status = ProposalStatus::Approved;
+                    proposal.approved_at = env::block_timestamp();
+
+                    self.emit("proposal_approved", serde_json::json!({
+                        "wallet": wallet_name, "proposal_id": proposal_id,
+                        "approval_count": proposal.approval_count(),
+                    }));
+
+                    log!("Proposal #{} approved", proposal_id);
+                }
+            }
+            "cancel" => {
+                proposal.set_cancellation(approver_index as usize);
+
+                if proposal.cancellation_count() >= intent.cancellation_threshold as u32 {
+                    proposal.status = ProposalStatus::Cancelled;
+                    let mut intent_mut = intent.clone();
+                    intent_mut.active_proposal_count = intent_mut.active_proposal_count.saturating_sub(1);
+                    self.intents.insert(&ikey, &intent_mut);
+
+                    self.emit("proposal_cancelled", serde_json::json!({
+                        "wallet": wallet_name, "proposal_id": proposal_id,
+                        "cancellation_count": proposal.cancellation_count(),
+                    }));
+                }
+            }
+            _ => env::panic_str("ERR_INVALID_ACTION"),
+        }
+
+        self.proposals.insert(&pkey, &proposal);
+    }
+
     fn create_meta_intents(&mut self, name: &str, owner: &AccountId) {
-        let make_intent = |index: u32, itype: IntentType, iname: &str, template: &str, params: Vec<ParamDef>| Intent {
+        let make = |index: u32, itype: IntentType, iname: &str, template: &str, params: Vec<ParamDef>| Intent {
             wallet_name: name.to_string(),
             index,
             intent_type: itype,
@@ -892,104 +778,161 @@ impl Contract {
             active_proposal_count: 0,
         };
 
-        self.intents.insert(
-            &intent_key(name, 0),
-            &make_intent(
-                0,
-                IntentType::AddIntent,
-                "AddIntent",
-                "add intent definition_hash: {hash}",
-                vec![ParamDef { name: "hash".to_string(), param_type: ParamType::String, max_value: None }],
-            ),
-        );
-        self.intents.insert(
-            &intent_key(name, 1),
-            &make_intent(
-                1,
-                IntentType::RemoveIntent,
-                "RemoveIntent",
-                "remove intent {index}",
-                vec![ParamDef { name: "index".to_string(), param_type: ParamType::U64, max_value: None }],
-            ),
-        );
-        self.intents.insert(
-            &intent_key(name, 2),
-            &make_intent(
-                2,
-                IntentType::UpdateIntent,
-                "UpdateIntent",
-                "update intent {index}",
-                vec![ParamDef { name: "index".to_string(), param_type: ParamType::U64, max_value: None }],
-            ),
-        );
+        self.intents.insert(&intent_key(name, 0), &make(
+            0, IntentType::AddIntent, "AddIntent", "add intent definition_hash: {hash}",
+            vec![ParamDef { name: "hash".to_string(), param_type: ParamType::String, max_value: None }],
+        ));
+        self.intents.insert(&intent_key(name, 1), &make(
+            1, IntentType::RemoveIntent, "RemoveIntent", "remove intent {index}",
+            vec![ParamDef { name: "index".to_string(), param_type: ParamType::U64, max_value: None }],
+        ));
+        self.intents.insert(&intent_key(name, 2), &make(
+            2, IntentType::UpdateIntent, "UpdateIntent", "update intent {index}",
+            vec![ParamDef { name: "index".to_string(), param_type: ParamType::U64, max_value: None }],
+        ));
     }
 
     fn validate_intent(&self, intent: &Intent) {
-        assert!(
-            intent.approvers.len() <= MAX_APPROVERS,
-            "Max {} approvers (bitmap limit)",
-            MAX_APPROVERS
-        );
-        assert!(
-            intent.approval_threshold as usize <= intent.approvers.len(),
-            "Threshold exceeds approvers"
-        );
-        assert!(
-            intent.cancellation_threshold as usize <= intent.approvers.len(),
-            "Cancellation threshold exceeds approvers"
-        );
-        assert!(
-            !intent.params.is_empty(),
-            "Intent must have at least one param definition"
-        );
-        assert!(
-            intent.execution_gas_tgas <= MAX_EXECUTION_GAS_TGAS,
-            "Execution gas exceeds max ({} Tgas)",
-            MAX_EXECUTION_GAS_TGAS
-        );
+        assert!(intent.approvers.len() <= MAX_APPROVERS, "ERR_MAX_APPROVERS");
+        assert!(intent.approval_threshold as usize <= intent.approvers.len(), "ERR_THRESHOLD_EXCEEDS");
+        assert!(intent.cancellation_threshold as usize <= intent.approvers.len(), "ERR_CANCEL_THRESHOLD");
+        assert!(!intent.params.is_empty(), "ERR_EMPTY_PARAMS");
+        assert!(intent.execution_gas_tgas <= MAX_EXECUTION_GAS_TGAS, "ERR_GAS_TOO_HIGH");
     }
 
     fn validate_params(&self, intent: &Intent, params: &serde_json::Value) {
         for pd in &intent.params {
             match params.get(&pd.name) {
-                None => panic!("Missing param: {}", pd.name),
+                None => env::panic_str(&format!("ERR_MISSING_PARAM: {}", pd.name)),
                 Some(val) => match pd.param_type {
                     ParamType::AccountId => {
-                        let s = val.as_str().unwrap_or_else(|| panic!("{}: expected string", pd.name));
-                        s.parse::<AccountId>().unwrap_or_else(|_| panic!("{}: invalid account ID", pd.name));
+                        let s = val.as_str().unwrap_or_else(|| env::panic_str(&format!("ERR_EXPECTED_STRING: {}", pd.name)));
+                        s.parse::<AccountId>().unwrap_or_else(|_| env::panic_str(&format!("ERR_INVALID_ACCOUNT: {}", pd.name)));
                     }
                     ParamType::U64 => {
-                        let v = val
-                            .as_u64()
+                        let v = val.as_u64()
                             .or_else(|| val.as_str().and_then(|s| s.parse::<u64>().ok()))
-                            .unwrap_or_else(|| panic!("{}: expected u64, got {:?}", pd.name, val));
+                            .unwrap_or_else(|| env::panic_str(&format!("ERR_EXPECTED_U64: {}", pd.name)));
                         if let Some(max) = &pd.max_value {
-                            assert!((v as u128) <= max.0, "{} exceeds max", pd.name);
+                            assert!((v as u128) <= max.0, "ERR_EXCEEDS_MAX: {}", pd.name);
                         }
                     }
                     ParamType::U128 => {
                         let s = match val {
                             serde_json::Value::String(s) => s.clone(),
                             serde_json::Value::Number(n) => n.to_string(),
-                            _ => panic!("{}: expected number, got {:?}", pd.name, val),
+                            _ => env::panic_str(&format!("ERR_EXPECTED_U128: {}", pd.name)),
                         };
-                        let v: u128 = s
-                            .parse()
-                            .unwrap_or_else(|_| panic!("{}: invalid u128 '{}'", pd.name, s));
+                        let v: u128 = s.parse().unwrap_or_else(|_| env::panic_str(&format!("ERR_INVALID_U128: {}", pd.name)));
                         if let Some(max) = &pd.max_value {
-                            assert!(v <= max.0, "{} exceeds max", pd.name);
+                            assert!(v <= max.0, "ERR_EXCEEDS_MAX: {}", pd.name);
                         }
                     }
                     ParamType::String => {
-                        val.as_str()
-                            .unwrap_or_else(|| panic!("{}: expected string", pd.name));
+                        val.as_str().unwrap_or_else(|| env::panic_str(&format!("ERR_EXPECTED_STRING: {}", pd.name)));
                     }
                     ParamType::Bool => {
-                        val.as_bool()
-                            .unwrap_or_else(|| panic!("{}: expected bool", pd.name));
+                        val.as_bool().unwrap_or_else(|| env::panic_str(&format!("ERR_EXPECTED_BOOL: {}", pd.name)));
                     }
                 },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_render_template() {
+        let intent = Intent {
+            wallet_name: "test".to_string(),
+            index: 3,
+            intent_type: IntentType::Custom,
+            name: "Transfer NEAR".to_string(),
+            template: "transfer {amount} yoctoNEAR to {recipient}".to_string(),
+            proposers: vec![],
+            approvers: vec![],
+            approval_threshold: 1,
+            cancellation_threshold: 1,
+            timelock_seconds: 0,
+            params: vec![
+                ParamDef { name: "amount".to_string(), param_type: ParamType::U128, max_value: None },
+                ParamDef { name: "recipient".to_string(), param_type: ParamType::AccountId, max_value: None },
+            ],
+            execution_gas_tgas: 50,
+            active: true,
+            active_proposal_count: 0,
+        };
+
+        let params = serde_json::json!({
+            "amount": "1000000000000000000000000",
+            "recipient": "bob.near"
+        });
+
+        assert_eq!(
+            intent.render_template(&params),
+            "transfer 1000000000000000000000000 yoctoNEAR to bob.near"
+        );
+    }
+
+    #[test]
+    fn test_proposal_bitmap() {
+        let mut p = Proposal {
+            id: 0, wallet_name: "w".to_string(), intent_index: 0,
+            proposer: "alice.near".parse().unwrap(), status: ProposalStatus::Active,
+            proposed_at: 0, approved_at: 0, expires_at: 0,
+            approval_bitmap: 0, cancellation_bitmap: 0,
+            param_values: "{}".to_string(), message: "".to_string(),
+            intent_params_hash: "".to_string(),
+        };
+
+        assert_eq!(p.approval_count(), 0);
+        assert!(!p.has_approved(0));
+
+        p.set_approval(0);
+        assert!(p.has_approved(0));
+        assert_eq!(p.approval_count(), 1);
+
+        p.set_cancellation(0);
+        assert!(!p.has_approved(0)); // cancelled clears approval
+        assert_eq!(p.cancellation_count(), 1);
+
+        p.reset_votes();
+        assert_eq!(p.approval_count(), 0);
+        assert_eq!(p.cancellation_count(), 0);
+    }
+
+    #[test]
+    fn test_template_injection_blocked() {
+        let intent = Intent {
+            wallet_name: "test".to_string(),
+            index: 0,
+            intent_type: IntentType::Custom,
+            name: "test".to_string(),
+            template: "do {param}".to_string(),
+            proposers: vec![], approvers: vec![],
+            approval_threshold: 1, cancellation_threshold: 1,
+            timelock_seconds: 0,
+            params: vec![ParamDef { name: "param".to_string(), param_type: ParamType::String, max_value: None }],
+            execution_gas_tgas: 50,
+            active: true,
+            active_proposal_count: 0,
+        };
+
+        // Pipe should be rejected
+        let params = serde_json::json!({ "param": "evil | wallet: fake" });
+        let result = std::panic::catch_unwind(|| intent.render_template(&params));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_safe_json_ft_transfer() {
+        let json = safe_json_ft_transfer("bob.near", "1000000");
+        let parsed: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(parsed["receiver_id"], "bob.near");
+        assert_eq!(parsed["amount"], "1000000");
+        assert_eq!(parsed["msg"], "");
     }
 }

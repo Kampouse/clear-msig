@@ -79,9 +79,9 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_build_custom_message() {
-        let intent = Intent {
+    fn make_test_intent() -> Intent {
+        Intent {
+            wallet_name: "treasury".to_string(),
             index: 3,
             intent_type: IntentType::Custom,
             name: "Transfer NEAR".to_string(),
@@ -95,7 +95,7 @@ mod tests {
                 ParamDef {
                     name: "amount".to_string(),
                     param_type: ParamType::U128,
-                    max_value: Some(U128(10_000_000_000_000_000_000_000_000)), // 10M NEAR
+                    max_value: Some(U128(10_000_000_000_000_000_000_000_000)),
                 },
                 ParamDef {
                     name: "recipient".to_string(),
@@ -103,27 +103,49 @@ mod tests {
                     max_value: None,
                 },
             ],
+            execution_gas_tgas: 50,
             active: true,
             active_proposal_count: 0,
-        };
+        }
+    }
 
+    #[test]
+    fn test_build_custom_message() {
+        let intent = make_test_intent();
         let params = serde_json::json!({
-            "amount": 1000000000000000000000000,
+            "amount": "1000000000000000000000000",
             "recipient": "bob.near"
         });
 
-        let msg = build_message(
-            "treasury",
-            42,
-            1893456000_000_000_000,
-            "propose",
-            &intent,
-            &params,
-        );
+        let msg = build_message("treasury", 42, 1893456000_000_000_000, "propose", &intent, &params);
 
         assert!(msg.contains("transfer 1000000000000000000000000 NEAR to bob.near"));
         assert!(msg.contains("wallet: treasury proposal: 42"));
         assert!(msg.contains("expires"));
         assert!(msg.contains("propose"));
+    }
+
+    #[test]
+    fn test_build_message_all_actions() {
+        let intent = make_test_intent();
+        let params = serde_json::json!({
+            "amount": "1000000000000000000000000",
+            "recipient": "bob.near"
+        });
+
+        for action in &["propose", "approve", "cancel", "amend"] {
+            let msg = build_message("w", 0, 1000000000_000_000_000, action, &intent, &params);
+            assert!(msg.starts_with("expires"));
+            assert!(msg.contains(action));
+        }
+    }
+
+    #[test]
+    fn test_hex_encode_decode() {
+        let original = vec![0x00, 0x01, 0xfe, 0xff];
+        let encoded = hex_encode(&original);
+        assert_eq!(encoded, "0001feff");
+        let decoded = hex_decode(&encoded);
+        assert_eq!(decoded, original);
     }
 }
