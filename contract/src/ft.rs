@@ -7,13 +7,13 @@
 use crate::*;
 
 /// FT balance key: wallet_name + token_account_id
-fn ft_balance_key(wallet: &str, token: &str) -> String {
+pub(crate) fn ft_balance_key(wallet: &str, token: &str) -> String {
     format!("{}:ft:{}", wallet, token)
 }
 
 /// Check if a token is in the wallet's allowlist.
 /// Empty allowlist = accept all.
-fn is_token_allowed(wallet: &Wallet, token: &AccountId) -> bool {
+pub(crate) fn is_token_allowed(wallet: &Wallet, token: &AccountId) -> bool {
     wallet.allowed_tokens.is_empty() || wallet.allowed_tokens.contains(token)
 }
 

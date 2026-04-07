@@ -61,7 +61,7 @@ pub fn verify_signature(public_key: &str, signature_hex: &str, message: &str) {
     assert!(valid, "Invalid signature: the message was not signed by this key");
 }
 
-fn hex_decode(s: &str) -> Vec<u8> {
+pub fn hex_decode(s: &str) -> Vec<u8> {
     (0..s.len())
         .step_by(2)
         .map(|i| {

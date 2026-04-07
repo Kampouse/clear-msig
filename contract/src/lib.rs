@@ -216,9 +216,6 @@ pub struct Wallet {
     pub ft_token_count: u32,
 }
 
-/// Storage cost per FT token entry (key + u128 value ≈ 100 bytes)
-const FT_ENTRY_STORAGE_BYTES: u64 = 100;
-
 // ── Composite keys ─────────────────────────────────────────────────────────
 
 fn intent_key(wallet: &str, index: u32) -> String {
@@ -824,6 +821,7 @@ impl Contract {
         ));
     }
 
+    #[allow(dead_code)]
     fn validate_intent(&self, intent: &Intent) {
         assert!(intent.approvers.len() <= MAX_APPROVERS, "ERR_MAX_APPROVERS");
         assert!(intent.approval_threshold as usize <= intent.approvers.len(), "ERR_THRESHOLD_EXCEEDS");
@@ -871,6 +869,9 @@ impl Contract {
         }
     }
 }
+
+#[cfg(test)]
+mod verification;
 
 #[cfg(test)]
 mod tests {
