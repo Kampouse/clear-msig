@@ -1,0 +1,13 @@
+[package]
+name = "clear-msig-formal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vstd = { git = "https://github.com/verus-lang/verus", branch = "main" }
+builtin = { git = "https://github.com/verus-lang/verus", branch = "main" }
+builtin_macros = { git = "https://github.com/verus-lang/verus", branch = "main" }
+
+[[bin]]
+name = "verify"
+path = "src/main.rs"
