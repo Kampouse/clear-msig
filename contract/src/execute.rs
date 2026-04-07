@@ -112,9 +112,6 @@ impl Contract {
         let timelock = params.get("timelock_seconds").and_then(|v| v.as_u64()).unwrap_or(0);
         let gas_tgas = params.get("execution_gas_tgas").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_EXECUTION_GAS_TGAS);
 
-        assert!(approvers.len() <= MAX_APPROVERS, "ERR_MAX_APPROVERS");
-        assert!(threshold as usize <= approvers.len(), "ERR_THRESHOLD_EXCEEDS");
-
         // Parse param definitions
         let param_defs: Vec<ParamDef> = params
             .get("params").and_then(|v| v.as_array())
@@ -139,7 +136,11 @@ impl Contract {
             })
             .unwrap_or_default();
 
+        // Validate
+        assert!(approvers.len() <= MAX_APPROVERS, "ERR_MAX_APPROVERS");
+        assert!(threshold as usize <= approvers.len(), "ERR_THRESHOLD_EXCEEDS");
         assert!(!param_defs.is_empty(), "ERR_DYNAMIC_PARAMS_REQUIRED");
+        assert!(gas_tgas <= MAX_EXECUTION_GAS_TGAS, "ERR_GAS_TOO_HIGH");
 
         let intent = Intent {
             wallet_name: wallet_name.to_string(),

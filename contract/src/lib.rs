@@ -821,15 +821,6 @@ impl Contract {
         ));
     }
 
-    #[allow(dead_code)]
-    fn validate_intent(&self, intent: &Intent) {
-        assert!(intent.approvers.len() <= MAX_APPROVERS, "ERR_MAX_APPROVERS");
-        assert!(intent.approval_threshold as usize <= intent.approvers.len(), "ERR_THRESHOLD_EXCEEDS");
-        assert!(intent.cancellation_threshold as usize <= intent.approvers.len(), "ERR_CANCEL_THRESHOLD");
-        assert!(!intent.params.is_empty(), "ERR_EMPTY_PARAMS");
-        assert!(intent.execution_gas_tgas <= MAX_EXECUTION_GAS_TGAS, "ERR_GAS_TOO_HIGH");
-    }
-
     fn validate_params(&self, intent: &Intent, params: &serde_json::Value) {
         for pd in &intent.params {
             match params.get(&pd.name) {
