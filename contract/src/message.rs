@@ -18,24 +18,15 @@ pub fn build_message(
 ) -> String {
     let content = match intent.intent_type {
         IntentType::AddIntent => {
-            let hash = params
-                .get("hash")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
+            let hash = params.get("hash").and_then(|v| v.as_str()).unwrap_or("unknown");
             format!("add intent definition_hash: {}", hash)
         }
         IntentType::RemoveIntent => {
-            let idx = params
-                .get("index")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let idx = params.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
             format!("remove intent {}", idx)
         }
         IntentType::UpdateIntent => {
-            let idx = params
-                .get("index")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let idx = params.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
             format!("update intent {}", idx)
         }
         IntentType::Custom => intent.render_template(params),

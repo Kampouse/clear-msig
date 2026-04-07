@@ -1,30 +1,31 @@
 /**
  * clear-msig Reference Client
  *
- * TypeScript client for interacting with the clear-msig multisig contract.
- * Handles message building, signing, and contract calls.
+ * TypeScript client for the clear-msig multisig contract on NEAR Protocol.
+ * Handles message building, signing, delegation, amendments, and all contract calls.
  *
- * Usage:
- *   import { ClearMsig } from './index';
- *   const client = new ClearMsig('clear-msig.kampouse.testnet', 'testnet');
- *   await client.createWallet('treasury');
- *   const proposal = await client.propose('treasury', 3, params, keyPair);
+ * @example
+ * ```ts
+ * import { ClearMsig, nearToYocto } from './index';
+ * const client = new ClearMsig('clear-msig.kampouse.testnet', 'testnet');
+ * await client.createWallet(account, 'treasury', NearToken.from_yoctonear('500000000000000000000000'));
+ * ```
  */
 
-import { KeyPair, utils } from 'near-api-js';
+import { KeyPair, utils, ConnectedWalletAccount } from 'near-api-js';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
 export type ParamType = 'AccountId' | 'U64' | 'U128' | 'String' | 'Bool';
+export type IntentType = 'Custom' | 'AddIntent' | 'RemoveIntent' | 'UpdateIntent';
+export type ProposalStatus = 'Active' | 'Approved' | 'Executed' | 'Cancelled';
+export type MessageAction = 'propose' | 'approve' | 'cancel' | 'amend';
 
 export interface ParamDef {
   name: string;
   param_type: ParamType;
   max_value: string | null;
 }
-
-export type IntentType = 'Custom' | 'AddIntent' | 'RemoveIntent' | 'UpdateIntent';
-export type ProposalStatus = 'Active' | 'Approved' | 'Executed' | 'Cancelled';
 
 export interface Intent {
   wallet_name: string;
@@ -38,6 +39,7 @@ export interface Intent {
   cancellation_threshold: number;
   timelock_seconds: number;
   params: ParamDef[];
+  execution_gas_tgas: number;
   active: boolean;
   active_proposal_count: number;
 }
@@ -55,6 +57,7 @@ export interface Proposal {
   cancellation_bitmap: number;
   param_values: string;
   message: string;
+  intent_params_hash: string;
 }
 
 export interface Wallet {
@@ -63,11 +66,21 @@ export interface Wallet {
   proposal_index: number;
   intent_index: number;
   created_at: number;
+  storage_deposit: string;
 }
 
 export interface ProposeParams {
   [key: string]: string | number | boolean;
 }
+
+// ── Constants ──────────────────────────────────────────────────────────────
+
+/** Storage deposit required to create a wallet (0.5 NEAR in yocto) */
+export const STORAGE_DEPOSIT = '500000000000000000000000';
+/** Default execution gas in teragas */
+export const DEFAULT_EXECUTION_GAS_TGAS = 50;
+/** Maximum execution gas in teragas */
+export const MAX_EXECUTION_GAS_TGAS = 300;
 
 // ── Message Builder ────────────────────────────────────────────────────────
 
@@ -78,42 +91,31 @@ export interface ProposeParams {
 export function buildMessage(
   walletName: string,
   proposalIndex: number,
-  expiresAt: bigint, // nanoseconds
-  action: 'propose' | 'approve' | 'cancel',
+  expiresAtNs: bigint,
+  action: MessageAction,
   intent: Intent,
   params: ProposeParams,
 ): string {
   const content = buildContent(intent, params);
-  const expiresSecs = expiresAt / BigInt(1_000_000_000);
-  const expiresNanos = expiresAt % BigInt(1_000_000_000);
+  const expiresSecs = expiresAtNs / BigInt(1_000_000_000);
+  const expiresNanos = expiresAtNs % BigInt(1_000_000_000);
   const expiresDisplay = `${expiresSecs}.${expiresNanos.toString().padStart(9, '0')}`;
-
   return `expires ${expiresDisplay}: ${action} ${content} | wallet: ${walletName} proposal: ${proposalIndex}`;
 }
 
 function buildContent(intent: Intent, params: ProposeParams): string {
   switch (intent.intent_type) {
-    case 'AddIntent': {
-      const hash = (params['hash'] as string) ?? 'unknown';
-      return `add intent definition_hash: ${hash}`;
-    }
-    case 'RemoveIntent': {
-      const idx = Number(params['index'] ?? 0);
-      return `remove intent ${idx}`;
-    }
-    case 'UpdateIntent': {
-      const idx = Number(params['index'] ?? 0);
-      return `update intent ${idx}`;
-    }
+    case 'AddIntent':
+      return `add intent definition_hash: ${params['hash'] ?? 'unknown'}`;
+    case 'RemoveIntent':
+      return `remove intent ${Number(params['index'] ?? 0)}`;
+    case 'UpdateIntent':
+      return `update intent ${Number(params['index'] ?? 0)}`;
     case 'Custom':
       return renderTemplate(intent.template, intent.params, params);
   }
 }
 
-/**
- * Render a template by substituting {param} placeholders with values.
- * U128 values are always rendered as full decimal strings.
- */
 export function renderTemplate(
   template: string,
   paramDefs: ParamDef[],
@@ -124,80 +126,46 @@ export function renderTemplate(
     const placeholder = `{${pd.name}}`;
     const raw = params[pd.name];
     if (raw === undefined) continue;
-
-    const value = renderParam(pd.param_type, raw);
-    result = result.replace(placeholder, value);
+    result = result.replace(placeholder, renderParam(pd.param_type, raw));
   }
   return result;
 }
 
 function renderParam(type: ParamType, value: string | number | boolean): string {
   switch (type) {
-    case 'AccountId':
-      return String(value);
-    case 'U64':
-      return String(value);
-    case 'U128':
-      // Always full decimal string — no scientific notation
-      return value instanceof bigint ? value.toString() : String(value);
-    case 'String':
-      return String(value);
-    case 'Bool':
-      return String(value);
+    case 'AccountId': return String(value);
+    case 'U64': return String(value);
+    case 'U128': return value instanceof bigint ? value.toString() : String(value);
+    case 'String': return String(value);
+    case 'Bool': return String(value);
   }
 }
 
 // ── Signing ────────────────────────────────────────────────────────────────
 
-/**
- * Sign a message with an ed25519 key pair.
- * Returns the signature as a hex string.
- */
 export function signMessage(keyPair: KeyPair, message: string): string {
   const msgBytes = new TextEncoder().encode(message);
   const { signature } = keyPair.sign(msgBytes);
   return Buffer.from(signature).toString('hex');
 }
 
-/**
- * Get the hex representation of a public key (without ed25519: prefix).
- */
 export function publicKeyToHex(keyPair: KeyPair): string {
   const pk = keyPair.getPublicKey();
   return Buffer.from(pk.data).toString('hex');
 }
 
-// ── U128 Helper ────────────────────────────────────────────────────────────
+// ── U128 Helpers ───────────────────────────────────────────────────────────
 
-/**
- * Safe U128 representation.
- * JavaScript Number loses precision above 2^53.
- * Always use BigInt or string for U128 values.
- *
- * @example
- *   const amount = u128("1000000000000000000000000"); // 1 NEAR in yocto
- *   const max = u128(10_000_000) * u128("1000000000000000000000000"); // 10M NEAR
- */
 export function u128(value: string | number | bigint): string {
   return BigInt(value).toString();
 }
 
-/**
- * NEAR to yoctoNEAR conversion.
- * @param near - NEAR amount (supports decimal)
- * @returns yoctoNEAR as string
- */
 export function nearToYocto(near: string): string {
   const [intPart, decPart = ''] = near.split('.');
   const padded = decPart.padEnd(24, '0').slice(0, 24);
   return BigInt(intPart + padded).toString();
 }
 
-/**
- * YoctoNEAR to NEAR conversion.
- * @param yocto - yoctoNEAR amount as string
- * @returns NEAR amount as string
- */
 export function yoctoToNear(yocto: string): string {
   const y = BigInt(yocto);
   const whole = y / BigInt('1000000000000000000000000');
@@ -205,6 +173,11 @@ export function yoctoToNear(yocto: string): string {
   if (frac === 0n) return whole.toString();
   const fracStr = frac.toString().padStart(24, '0').replace(/0+$/, '');
   return `${whole}.${fracStr}`;
+}
+
+/** Generate an expiry nanoseconds `secondsFromNow` seconds in the future */
+export function expiryFromNow(secondsFromNow: number): bigint {
+  return BigInt(Math.floor(Date.now() / 1000 + secondsFromNow)) * BigInt(1_000_000_000);
 }
 
 // ── Contract Client ────────────────────────────────────────────────────────
@@ -215,7 +188,7 @@ export class ClearMsig {
     public readonly networkId: 'testnet' | 'mainnet',
   ) {}
 
-  // ── View Methods ──────────────────────────────────────────────────────
+  // ── Views ──────────────────────────────────────────────────────────
 
   async getWallet(account: any, name: string): Promise<Wallet | null> {
     return account.viewFunction(this.contractId, 'get_wallet', { name });
@@ -223,8 +196,7 @@ export class ClearMsig {
 
   async getIntent(account: any, walletName: string, index: number): Promise<Intent | null> {
     return account.viewFunction(this.contractId, 'get_intent', {
-      wallet_name: walletName,
-      index,
+      wallet_name: walletName, index,
     });
   }
 
@@ -236,8 +208,7 @@ export class ClearMsig {
 
   async getProposal(account: any, walletName: string, id: number): Promise<Proposal | null> {
     return account.viewFunction(this.contractId, 'get_proposal', {
-      wallet_name: walletName,
-      id,
+      wallet_name: walletName, id,
     });
   }
 
@@ -249,22 +220,72 @@ export class ClearMsig {
 
   async getProposalMessage(account: any, walletName: string, id: number): Promise<string | null> {
     return account.viewFunction(this.contractId, 'get_proposal_message', {
-      wallet_name: walletName,
-      id,
+      wallet_name: walletName, id,
     });
   }
 
-  // ── Write Methods ─────────────────────────────────────────────────────
+  async getDelegation(
+    account: any,
+    walletName: string,
+    intentIndex: number,
+    approverIndex: number,
+  ): Promise<string | null> {
+    return account.viewFunction(this.contractId, 'get_delegation', {
+      wallet_name: walletName,
+      intent_index: intentIndex,
+      approver_index: approverIndex,
+    });
+  }
+
+  async getEventNonce(account: any): Promise<number> {
+    return account.viewFunction(this.contractId, 'get_event_nonce');
+  }
+
+  // ── Wallet Management ─────────────────────────────────────────────
 
   async createWallet(account: any, name: string): Promise<void> {
     await account.functionCall({
       contractId: this.contractId,
       methodName: 'create_wallet',
       args: { name },
+      attachedDeposit: utils.format.parseNearToken('0.5'),
     });
   }
 
-  async addIntent(account: any, walletName: string, intent: Omit<Intent, 'wallet_name' | 'index' | 'active' | 'active_proposal_count'>): Promise<void> {
+  async deleteWallet(account: any, name: string): Promise<void> {
+    await account.functionCall({
+      contractId: this.contractId,
+      methodName: 'delete_wallet',
+      args: { name },
+    });
+  }
+
+  async transferOwnership(account: any, walletName: string, newOwner: string): Promise<void> {
+    await account.functionCall({
+      contractId: this.contractId,
+      methodName: 'transfer_ownership',
+      args: { wallet_name: walletName, new_owner: newOwner },
+    });
+  }
+
+  // ── Intent Management ─────────────────────────────────────────────
+
+  async addIntent(
+    account: any,
+    walletName: string,
+    intent: {
+      intent_type: IntentType;
+      name: string;
+      template: string;
+      proposers: string[];
+      approvers: string[];
+      approval_threshold: number;
+      cancellation_threshold: number;
+      timelock_seconds: number;
+      params: ParamDef[];
+      execution_gas_tgas?: number;
+    },
+  ): Promise<void> {
     await account.functionCall({
       contractId: this.contractId,
       methodName: 'add_intent',
@@ -272,8 +293,9 @@ export class ClearMsig {
         wallet_name: walletName,
         intent: {
           ...intent,
+          execution_gas_tgas: intent.execution_gas_tgas ?? DEFAULT_EXECUTION_GAS_TGAS,
           wallet_name: walletName,
-          index: 0, // contract assigns the real index
+          index: 0,
           active: true,
           active_proposal_count: 0,
         },
@@ -281,21 +303,29 @@ export class ClearMsig {
     });
   }
 
-  /**
-   * Create a proposal with clear-signing.
-   *
-   * @example
-   * ```ts
-   * const result = await client.propose('treasury', 3, {
-   *   amount: '1000000000000000000000000',
-   *   recipient: 'bob.testnet',
-   * }, keyPair, account, {
-   *   expiresAtNs: BigInt(Date.now() + 86400000) * BigInt(1_000_000),
-   * });
-   * console.log('Proposal:', result.proposalId);
-   * console.log('Message:', result.message);
-   * ```
-   */
+  // ── Delegation ────────────────────────────────────────────────────
+
+  async delegateApprover(
+    account: any,
+    walletName: string,
+    intentIndex: number,
+    approverIndex: number,
+    delegate: string,
+  ): Promise<void> {
+    await account.functionCall({
+      contractId: this.contractId,
+      methodName: 'delegate_approver',
+      args: {
+        wallet_name: walletName,
+        intent_index: intentIndex,
+        approver_index: approverIndex,
+        delegate,
+      },
+    });
+  }
+
+  // ── Proposals ─────────────────────────────────────────────────────
+
   async propose(
     walletName: string,
     intentIndex: number,
@@ -304,7 +334,6 @@ export class ClearMsig {
     account: any,
     options: { expiresAtNs: bigint },
   ): Promise<{ proposalId: number; message: string }> {
-    // Fetch intent to build the message
     const intent = await this.getIntent(account, walletName, intentIndex);
     if (!intent) throw new Error(`Intent #${intentIndex} not found`);
 
@@ -312,22 +341,10 @@ export class ClearMsig {
     if (!wallet) throw new Error(`Wallet '${walletName}' not found`);
 
     const proposalIndex = wallet.proposal_index;
-
-    // Build the message (must match contract exactly)
-    const message = buildMessage(
-      walletName,
-      proposalIndex,
-      options.expiresAtNs,
-      'propose',
-      intent,
-      params,
-    );
-
-    // Sign
+    const message = buildMessage(walletName, proposalIndex, options.expiresAtNs, 'propose', intent, params);
     const signature = signMessage(keyPair, message);
     const proposerPubkey = publicKeyToHex(keyPair);
 
-    // Build param_values — ensure U128 values are strings
     const paramValues: Record<string, any> = {};
     for (const pd of intent.params) {
       const v = params[pd.name];
@@ -347,22 +364,55 @@ export class ClearMsig {
         proposer_pubkey: proposerPubkey,
         signature,
       },
-      gas: new utils.format.Gas('100').intoGas(), // 100 Tgas
+      gas: new utils.format.Gas('100').intoGas(),
     });
 
     return { proposalId: proposalIndex, message };
   }
 
-  /**
-   * Approve a proposal with clear-signing.
-   *
-   * @example
-   * ```ts
-   * const result = await client.approve('treasury', 0, 0, keyPair, account, {
-   *   expiresAtNs: BigInt(Date.now() + 86400000) * BigInt(1_000_000),
-   * });
-   * ```
-   */
+  async amendProposal(
+    walletName: string,
+    proposalId: number,
+    newParams: ProposeParams,
+    keyPair: KeyPair,
+    account: any,
+    options: { expiresAtNs: bigint },
+  ): Promise<{ message: string }> {
+    const proposal = await this.getProposal(account, walletName, proposalId);
+    if (!proposal) throw new Error(`Proposal #${proposalId} not found`);
+
+    const intent = await this.getIntent(account, walletName, proposal.intent_index);
+    if (!intent) throw new Error('Intent not found');
+
+    const message = buildMessage(walletName, proposalId, options.expiresAtNs, 'amend', intent, newParams);
+    const signature = signMessage(keyPair, message);
+    const proposerPubkey = publicKeyToHex(keyPair);
+
+    const paramValues: Record<string, any> = {};
+    for (const pd of intent.params) {
+      const v = newParams[pd.name];
+      if (v !== undefined) {
+        paramValues[pd.name] = pd.param_type === 'U128' ? String(v) : v;
+      }
+    }
+
+    await account.functionCall({
+      contractId: this.contractId,
+      methodName: 'amend_proposal',
+      args: {
+        wallet_name: walletName,
+        proposal_id: proposalId,
+        param_values: JSON.stringify(paramValues),
+        expires_at: options.expiresAtNs.toString(),
+        proposer_pubkey: proposerPubkey,
+        signature,
+      },
+      gas: new utils.format.Gas('100').intoGas(),
+    });
+
+    return { message };
+  }
+
   async approve(
     walletName: string,
     proposalId: number,
@@ -371,7 +421,6 @@ export class ClearMsig {
     account: any,
     options: { expiresAtNs: bigint },
   ): Promise<{ message: string }> {
-    // Fetch proposal and intent
     const proposal = await this.getProposal(account, walletName, proposalId);
     if (!proposal) throw new Error(`Proposal #${proposalId} not found`);
 
@@ -379,18 +428,7 @@ export class ClearMsig {
     if (!intent) throw new Error('Intent not found');
 
     const params: ProposeParams = JSON.parse(proposal.param_values);
-
-    // Build approve message
-    const message = buildMessage(
-      walletName,
-      proposalId,
-      options.expiresAtNs,
-      'approve',
-      intent,
-      params,
-    );
-
-    // Sign
+    const message = buildMessage(walletName, proposalId, options.expiresAtNs, 'approve', intent, params);
     const signature = signMessage(keyPair, message);
 
     await account.functionCall({
@@ -409,16 +447,6 @@ export class ClearMsig {
     return { message };
   }
 
-  /**
-   * Cancel-vote a proposal (requires clear-signed message).
-   *
-   * @example
-   * ```ts
-   * await client.cancelVote('treasury', 0, 0, keyPair, account, {
-   *   expiresAtNs: BigInt(Date.now() + 86400000) * BigInt(1_000_000),
-   * });
-   * ```
-   */
   async cancelVote(
     walletName: string,
     proposalId: number,
@@ -427,7 +455,6 @@ export class ClearMsig {
     account: any,
     options: { expiresAtNs: bigint },
   ): Promise<{ message: string }> {
-    // Fetch proposal and intent to build cancel message
     const proposal = await this.getProposal(account, walletName, proposalId);
     if (!proposal) throw new Error(`Proposal #${proposalId} not found`);
 
@@ -435,18 +462,7 @@ export class ClearMsig {
     if (!intent) throw new Error('Intent not found');
 
     const params: ProposeParams = JSON.parse(proposal.param_values);
-
-    // Build cancel message
-    const message = buildMessage(
-      walletName,
-      proposalId,
-      options.expiresAtNs,
-      'cancel',
-      intent,
-      params,
-    );
-
-    // Sign
+    const message = buildMessage(walletName, proposalId, options.expiresAtNs, 'cancel', intent, params);
     const signature = signMessage(keyPair, message);
 
     await account.functionCall({
@@ -465,40 +481,20 @@ export class ClearMsig {
     return { message };
   }
 
-  /**
-   * Execute an approved proposal.
-   */
-  async execute(
-    account: any,
-    walletName: string,
-    proposalId: number,
-  ): Promise<void> {
+  async execute(account: any, walletName: string, proposalId: number): Promise<void> {
     await account.functionCall({
       contractId: this.contractId,
       methodName: 'execute',
-      args: {
-        wallet_name: walletName,
-        proposal_id: proposalId,
-      },
+      args: { wallet_name: walletName, proposal_id: proposalId },
       gas: new utils.format.Gas('100').intoGas(),
     });
   }
 
-  /**
-   * Clean up an executed or cancelled proposal.
-   */
-  async cleanup(
-    account: any,
-    walletName: string,
-    proposalId: number,
-  ): Promise<void> {
+  async cleanup(account: any, walletName: string, proposalId: number): Promise<void> {
     await account.functionCall({
       contractId: this.contractId,
       methodName: 'cleanup',
-      args: {
-        wallet_name: walletName,
-        proposal_id: proposalId,
-      },
+      args: { wallet_name: walletName, proposal_id: proposalId },
     });
   }
 }
