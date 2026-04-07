@@ -272,6 +272,80 @@ near contract deploy <contract-id> use-file target/near/clear_msig.wasm \
 near call <contract-id> new --accountId <account-id> --networkId testnet
 ```
 
+## Reference Implementation
+
+A TypeScript client library is included in `reference/index.ts`.
+
+### Install
+
+```bash
+npm install near-api-js
+```
+
+### Quick Start
+
+```typescript
+import { ClearMsig, nearToYocto } from './reference';
+
+const client = new ClearMsig('clear-msig.kampouse.testnet', 'testnet');
+
+// Create wallet
+await client.createWallet(account, 'treasury');
+
+// Add a transfer intent
+await client.addIntent(account, 'treasury', {
+  intent_type: 'Custom',
+  name: 'Transfer NEAR',
+  template: 'transfer {amount} yoctoNEAR to {recipient}',
+  proposers: ['alice.testnet'],
+  approvers: ['alice.testnet', 'bob.testnet'],
+  approval_threshold: 2,
+  cancellation_threshold: 1,
+  timelock_seconds: 0,
+  params: [
+    { name: 'amount', param_type: 'U128', max_value: null },
+    { name: 'recipient', param_type: 'AccountId', max_value: null },
+  ],
+});
+
+// Propose
+const { proposalId, message } = await client.propose(
+  'treasury', 3,
+  { amount: nearToYocto('1.5'), recipient: 'bob.testnet' },
+  keyPair, account,
+  { expiresAtNs: BigInt(Date.now() + 86400000) * BigInt(1_000_000) },
+);
+console.log('Message to sign:', message);
+
+// Approve
+await client.approve('treasury', proposalId, 0, bobKeyPair, account, {
+  expiresAtNs: BigInt(Date.now() + 86400000) * BigInt(1_000_000),
+});
+
+// Execute
+await client.execute(account, 'treasury', proposalId);
+```
+
+### API
+
+| Function | Description |
+|----------|-------------|
+| `buildMessage(wallet, index, expires, action, intent, params)` | Build the human-readable message |
+| `signMessage(keyPair, message)` | Sign a message, returns hex signature |
+| `publicKeyToHex(keyPair)` | Get hex public key (no prefix) |
+| `renderTemplate(template, defs, params)` | Render intent template with params |
+| `u128(value)` | Safe U128 string from number/string/BigInt |
+| `nearToYocto(near)` | Convert NEAR to yoctoNEAR string |
+| `yoctoToNear(yocto)` | Convert yoctoNEAR to NEAR string |
+
+### Example
+
+```bash
+npx ts-node examples/full-flow.ts
+```
+
+Runs through message building, signing, approve flow, and U128 safety demos.
+
 ## Project Structure
 
 ```
@@ -281,6 +355,10 @@ clear-msig/
 │       ├── lib.rs       # Contract state, wallet/intent/proposal CRUD
 │       ├── execute.rs   # Proposal execution (NEAR transfer, FT transfer, custom events)
 │       └── message.rs   # Clear-signing message builder & ed25519 verification
+├── reference/
+│   └── index.ts         # TypeScript client library (reference implementation)
+├── examples/
+│   └── full-flow.ts     # Full flow demo
 └── README.md
 ```
 
