@@ -294,15 +294,115 @@ Placeholders `{param_name}` are replaced with parameter values:
 
 ## Building & Deploying
 
-```bash
-# Build
-cd contract && cargo near build non-reproducible-wasm
+### Prerequisites
 
-# Deploy + init (testnet)
+- [Rust](https://rustup.rs/) (1.86+)
+- [cargo-near](https://github.com/near/cargo-near) (`cargo install cargo-near`)
+- [near-cli-rs](https://docs.near.org/tools/near-cli-rs) (`cargo install near-cli-rs`)
+- A NEAR account with enough NEAR for deployment + storage
+
+### Build
+
+```bash
+cd contract
+cargo near build non-reproducible-wasm
+```
+
+Output: `target/near/clear_msig.wasm` (~200KB)
+
+### Deploy (Fresh)
+
+```bash
+# 1. Create a subaccount for the contract (recommended)
+near account create-account fund-myself <contract-id> '5 NEAR' \
+  sign-as <your-account> network-config testnet sign-with-keychain send
+
+# 2. Deploy contract code
 near contract deploy <contract-id> use-file target/near/clear_msig.wasm \
   without-init-call network-config testnet sign-with-keychain send
-near call <contract-id> new --accountId <account-id> --networkId testnet
+
+# 3. Initialize
+near call <contract-id> new --accountId <your-account> --networkId testnet
 ```
+
+### Deploy (Upgrade)
+
+```bash
+# Deploy new code over existing contract (preserves state if struct fields are compatible)
+near contract deploy <contract-id> use-file target/near/clear_msig.wasm \
+  without-init-call network-config testnet sign-with-keychain send
+```
+
+> ⚠️ If struct fields changed (e.g., new fields on Wallet/Intent/Proposal), existing state will fail to deserialize. You must delete and recreate the contract account, or write a migration init method.
+
+### First Wallet
+
+```bash
+# Create wallet (requires 0.5 NEAR storage deposit)
+near contract call-function as-transaction <contract-id> create_wallet \
+  json-args '{"name":"treasury"}' \
+  prepaid-gas '30.0 Tgas' attached-deposit '0.5 NEAR' \
+  sign-as <your-account> network-config testnet sign-with-keychain send
+```
+
+### Add an Intent (via Meta-Intent Proposal)
+
+Since `add_intent` is removed, all intents go through the AddIntent governance flow:
+
+```bash
+# 1. Propose adding a Transfer NEAR intent
+EXPIRY=$(python3 -c "import time; print(int(time.time()) + 86400)")
+EXPIRY_NS="${EXPIRY}000000000"
+
+# Build and sign the message (see reference/index.ts for client-side signing)
+# Then call propose() with the signed message
+
+# 2. Approve
+# 3. Execute — intent is now active
+```
+
+Or use the TypeScript client:
+
+```typescript
+import { ClearMsig, nearToYocto, expiryFromNow } from './reference';
+const client = new ClearMsig(contractId, 'testnet');
+
+// Propose AddIntent
+await client.propose('treasury', 0, {
+  hash: '<intent-definition-hash>',
+  name: 'Transfer NEAR',
+  template: 'transfer {amount} yoctoNEAR to {recipient}',
+  proposers: JSON.stringify(['alice.testnet']),
+  approvers: JSON.stringify(['alice.testnet', 'bob.testnet']),
+  approval_threshold: '2',
+  timelock_seconds: '0',
+  execution_gas_tgas: '50',
+  params: JSON.stringify([
+    { name: 'amount', param_type: 'U128', max_value: null },
+    { name: 'recipient', param_type: 'AccountId', max_value: null },
+  ]),
+}, keyPair, account, { expiresAtNs: expiryFromNow(86400) });
+```
+
+### Mainnet Deployment
+
+Same steps, but:
+- Replace `testnet` with `mainnet`
+- Use `--networkId mainnet`
+- Ensure your account has enough NEAR (5+ recommended for contract account)
+- **Get an audit first** if handling real funds
+
+### Troubleshooting
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `ERR_STORAGE_DEPOSIT` | Less than 0.5 NEAR attached | Add `attached-deposit '0.5 NEAR'` |
+| `ERR_WALLET_EXISTS` | Wallet name already taken | Use a different name |
+| `Cannot deserialize value with Borsh` | State incompatible after upgrade | Delete account and redeploy, or add migration |
+| `ERR_DIRECT_CALL_REQUIRED` | Called from another contract | Must be a direct user transaction |
+| `ERR_TOKEN_NOT_ALLOWED` | FT not on wallet's allowlist | Call `add_allowed_token` first |
+| `ERR_INSUFFICIENT_NEAR` | Wallet balance too low | Deposit NEAR first |
+| `ERR_MAX_PROPOSALS` | 100 active proposals on this intent | Wait for proposals to expire or execute |
 
 ## Reference Implementation
 
