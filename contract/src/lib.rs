@@ -307,6 +307,7 @@ impl Contract {
     // ── Wallet Management ──────────────────────────────────────────────
 
     /// Create a new wallet. Requires 0.5 NEAR storage deposit.
+    #[payable]
     pub fn create_wallet(&mut self, name: String) {
         let deposit = env::attached_deposit();
         assert!(
