@@ -2,6 +2,8 @@
 
 **Clear-signing multisig for NEAR Protocol.**
 
+> **Note:** This is a NEAR Protocol port of [ChewingGlass/clear-msig](https://github.com/ChewingGlass/clear-msig), the original clear-sign multisig built for Solana using [Quasar](https://github.com/blueshift-gg/quasar). The architecture (intents, proposals, clear-signed messages, vote switching, meta-intents) follows the same design.
+
 Signers see exactly what they're approving — human-readable messages, not opaque transaction bytes.
 
 ## How It Works
