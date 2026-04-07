@@ -2,22 +2,20 @@
 
 **Clear-signing multisig for NEAR Protocol.**
 
-> **Note:** This is a NEAR Protocol port of [ChewingGlass/clear-msig](https://github.com/ChewingGlass/clear-msig), the original clear-sign multisig built for Solana using [Quasar](https://github.com/blueshift-gg/quasar). The architecture (intents, proposals, clear-signed messages, vote switching, meta-intents) follows the same design.
+> **Note:** This is a NEAR Protocol port of [ChewingGlass/clear-msig](https://github.com/ChewingGlass/clear-msig), the original clear-sign multisig built for Solana using [Quasar](https://github.com/blueshift-gg/quasar).
 
 Signers see exactly what they're approving — human-readable messages, not opaque transaction bytes.
 
 ## How It Works
 
-Traditional multisigs have signers approve hashes of serialized transactions. You can't tell what you're signing without specialized tooling. **clear-msig** fixes this:
+Traditional multisigs have signers approve hashes of serialized transactions. **clear-msig** fixes this:
 
-1. **Intents** define what operations a wallet can perform (transfer NEAR, transfer FTs, custom actions)
+1. **Intents** define what operations a wallet can perform (transfer NEAR, transfer FTs, deposit, custom actions)
 2. **Proposals** fill in the parameters and generate a human-readable message
 3. **Signers** read the message, then sign it with their ed25519 key
-4. **Execution** happens only when enough approvals are collected
+4. **Execution** happens only when enough approvals are collected (after timelock)
 
 ### Message Format
-
-Every message follows this format:
 
 ```
 expires <timestamp>: <action> <content> | wallet: <name> proposal: <index>
@@ -30,23 +28,49 @@ expires 1893456000.000000000: propose transfer 1000000000000000000000000 yoctoNE
 
 No ambiguity. Signers know exactly what they're approving.
 
+## Features
+
+| Feature | Description |
+|---------|-------------|
+| Clear-signing | Human-readable messages signed with ed25519 |
+| Intent-based governance | Define allowed operations, proposers, approvers, thresholds |
+| Meta-intents | Self-governance: AddIntent, RemoveIntent, UpdateIntent |
+| Proposal lifecycle | Propose → Amend → Approve → Execute (with timelock) |
+| NEP-141 FT support | Receive, hold, and transfer fungible tokens |
+| Token allowlists | Per-wallet FT allowlist to prevent griefing |
+| Balance tracking | Internal accounting for NEAR and FT balances per wallet |
+| Delegation | Approvers can delegate their vote to another account |
+| Ownership transfer | Owner can transfer wallet ownership (meta-intents updated) |
+| Proposal amendment | Proposer can amend active proposals (resets votes) |
+| Wallet deletion | Owner can delete wallet, storage deposit refunded |
+| Event nonces | Monotonic counter for strict event ordering |
+| Configurable gas | Per-intent execution gas (default 50, max 300 Tgas) |
+| Storage accounting | Tracks actual bytes, accurate refunds |
+| Cross-contract protection | All signed methods reject contract-to-contract calls |
+| Intent schema pinning | SHA-256 hash prevents post-proposal schema changes |
+
 ## Concepts
 
 ### Wallets
 
 A wallet is a named container with:
-- An **owner** (creator)
+- An **owner** (creator, can be transferred)
 - A set of **intents** defining allowed operations
 - A set of **proposals** (pending, approved, executed, cancelled)
+- A **token allowlist** for FT reception
+- Internal **balance tracking** for NEAR and FTs
+- A **storage deposit** (0.5 NEAR required on creation)
 
 Every wallet is created with 3 **meta-intents** for self-governance:
 | Index | Intent | Purpose |
 |-------|--------|---------|
-| 0 | `AddIntent` | Add new operation types |
+| 0 | `AddIntent` | Add new operation types via proposal |
 | 1 | `RemoveIntent` | Deactivate an intent |
 | 2 | `UpdateIntent` | Modify intent parameters |
 
 ### Intents
+
+All intent changes go through the meta-intent proposal flow. There is no owner bypass — the multisig is fully governed by its thresholds.
 
 An intent defines an allowed operation:
 
@@ -59,20 +83,13 @@ An intent defines an allowed operation:
   "approval_threshold": 2,
   "cancellation_threshold": 2,
   "timelock_seconds": 86400,
+  "execution_gas_tgas": 50,
   "params": [
     { "name": "amount", "param_type": "U128", "max_value": "10000000000000000000000000" },
     { "name": "recipient", "param_type": "AccountId", "max_value": null }
   ]
 }
 ```
-
-- **proposers**: who can create proposals
-- **approvers**: who can approve/cancel proposals
-- **approval_threshold**: number of approvals needed
-- **cancellation_threshold**: number of cancellations to veto
-- **timelock_seconds**: delay between approval and execution
-- **params**: typed parameters with optional max values
-- **template**: human-readable template with `{param}` placeholders
 
 ### Proposals
 
@@ -82,6 +99,8 @@ A proposal is created when a proposer fills in parameters for an intent:
 2. **Approved** → threshold reached, awaiting execution (after timelock)
 3. **Executed** → action performed
 4. **Cancelled** → vetoed by cancellation threshold
+
+Proposals can be **amended** by the original proposer (resets all votes, requires clear-signed message).
 
 ### Parameter Types
 
@@ -93,144 +112,136 @@ A proposal is created when a proposer fills in parameters for an intent:
 | `String` | String | `"hello"` |
 | `Bool` | Boolean | `true` |
 
-> **Important**: Always pass `U128` values as strings in JSON. JavaScript `Number` cannot represent values > 2^53 without precision loss. Use a `BigNumber` or `BigInt` library on the client side.
+> **Important**: Always pass `U128` values as strings. JavaScript `Number` loses precision above 2^53.
+
+## Token & Balance Management
+
+### NEAR Balances
+
+The contract tracks NEAR per wallet internally:
+- **Deposit NEAR**: Execute a "Deposit NEAR" intent with attached deposit
+- **Transfer NEAR**: Debits from wallet's tracked balance, sends to recipient
+- **View balance**: `get_wallet_near_balance(wallet_name)`
+
+### FT (NEP-141) Support
+
+The contract implements `ft_on_transfer` to receive tokens:
+- Call `ft_transfer_call(contract_id, amount, wallet_name)` on the FT contract
+- Tokens are credited to the named wallet's internal balance
+- **Token allowlist**: Empty = accept all. Non-empty = only listed tokens accepted
+- `add_allowed_token(wallet, token)` / `remove_allowed_token(wallet, token)` — owner only
+- `get_ft_balance(wallet, token)` — view balance
+
+Storage is charged per unique token tracked (100 bytes per token from the storage deposit).
 
 ## Contract API
 
 ### Deployed
 
-- **Testnet**: `clear-msig.kampouse.testnet`
+- **Testnet**: `cmsig.kampouse.testnet`
 - **Repo**: [github.com/Kampouse/clear-msig](https://github.com/Kampouse/clear-msig)
 
-### Write Methods
+### Wallet Management
 
-#### `create_wallet(name: String)`
-Create a new wallet. Caller becomes the owner.
+| Method | Payable | Description |
+|--------|---------|-------------|
+| `create_wallet(name)` | Yes (0.5 NEAR) | Create wallet with 3 meta-intents |
+| `delete_wallet(name)` | No | Delete wallet, refund storage. No active proposals. |
+| `transfer_ownership(wallet, new_owner)` | No | Transfer ownership, update meta-intents |
 
-```bash
-near call clear-msig.kampouse.testnet create_wallet '{"name":"treasury"}' \
-  --accountId alice.testnet --networkId testnet
-```
+### Token Management
 
-#### `add_intent(wallet_name: String, intent: Intent)`
-Add a custom intent (owner only).
+| Method | Description |
+|--------|-------------|
+| `add_allowed_token(wallet, token)` | Add FT to wallet's allowlist (owner only) |
+| `remove_allowed_token(wallet, token)` | Remove FT from allowlist (owner only) |
+| `ft_on_transfer(sender, amount, msg)` | NEP-141 receiver. `msg` = wallet name |
 
-```bash
-near call clear-msig.kampouse.testnet add_intent '{
-  "wallet_name": "treasury",
-  "intent": {
-    "index": 0,
-    "intent_type": "Custom",
-    "name": "Transfer NEAR",
-    "template": "transfer {amount} yoctoNEAR to {recipient}",
-    "proposers": ["alice.testnet"],
-    "approvers": ["alice.testnet", "bob.testnet"],
-    "approval_threshold": 2,
-    "cancellation_threshold": 1,
-    "timelock_seconds": 0,
-    "params": [
-      {"name": "amount", "param_type": "U128", "max_value": null},
-      {"name": "recipient", "param_type": "AccountId", "max_value": null}
-    ],
-    "active": true,
-    "active_proposal_count": 0,
-    "wallet_name": "treasury"
-  }
-}' --accountId alice.testnet --networkId testnet
-```
+### Proposal Lifecycle
 
-#### `propose(wallet_name, intent_index, param_values, expires_at, proposer_pubkey, signature)`
-Create a proposal with a clear-signed message.
+| Method | Signed | Description |
+|--------|--------|-------------|
+| `propose(wallet, intent, params, expires, pubkey, sig)` | Yes | Create proposal with clear-signed message |
+| `amend_proposal(wallet, id, params, expires, pubkey, sig)` | Yes | Amend proposal (resets votes, proposer only) |
+| `approve(wallet, id, approver_idx, sig, expires)` | Yes | Approve with clear-signed message |
+| `cancel_vote(wallet, id, approver_idx, sig, expires)` | Yes | Cancel-vote with clear-signed message |
+| `execute(wallet, id)` | Optional* | Execute approved proposal |
+| `cleanup(wallet, id)` | No | Remove executed/cancelled proposal |
 
-**Signing (client-side):**
-```javascript
-import { sign } from 'near-api-js/lib/utils/key_pair';
+*`execute` is payable for "Deposit NEAR" intent; attaches NEAR which is credited to the wallet.
 
-const message = `expires 1893456000.000000000: propose transfer 1000000000000000000000000 yoctoNEAR to bob.testnet | wallet: treasury proposal: 0`;
-const signature = keyPair.sign(Buffer.from(message)).toString('hex');
-```
+### Delegation
 
-**On-chain:**
-```bash
-near call clear-msig.kampouse.testnet propose '{
-  "wallet_name": "treasury",
-  "intent_index": 3,
-  "param_values": "{\"amount\":\"1000000000000000000000000\",\"recipient\":\"bob.testnet\"}",
-  "expires_at": "1893456000000000000",
-  "proposer_pubkey": "<hex_public_key>",
-  "signature": "<hex_signature>"
-}' --accountId alice.testnet --networkId testnet --gas 100000000000000
-```
+| Method | Description |
+|--------|-------------|
+| `delegate_approver(wallet, intent, idx, delegate)` | Delegate approver slot to another account. Pass own account to revoke. |
 
-#### `approve(wallet_name, proposal_id, approver_index, signature, expires_at)`
-Approve a proposal with a clear-signed message.
-
-**Signing:**
-```javascript
-const message = `expires 1893456000.000000000: approve transfer 1000000000000000000000000 yoctoNEAR to bob.testnet | wallet: treasury proposal: 0`;
-const signature = keyPair.sign(Buffer.from(message)).toString('hex');
-```
-
-**On-chain:**
-```bash
-near call clear-msig.kampouse.testnet approve '{
-  "wallet_name": "treasury",
-  "proposal_id": 0,
-  "approver_index": 0,
-  "signature": "<hex_signature>",
-  "expires_at": "1893456000000000000"
-}' --accountId bob.testnet --networkId testnet --gas 100000000000000
-```
-
-#### `cancel_vote(wallet_name, proposal_id, approver_index)`
-Cancel-vote a proposal. Clears any prior approval from this approver.
-
-#### `execute(wallet_name, proposal_id)`
-Execute an approved proposal (after timelock, if any).
-
-```bash
-near call clear-msig.kampouse.testnet execute '{"wallet_name":"treasury","proposal_id":0}' \
-  --accountId alice.testnet --networkId testnet --gas 100000000000000
-```
-
-#### `cleanup(wallet_name, proposal_id)`
-Remove an executed or cancelled proposal from storage.
-
-### View Methods
+### Views
 
 | Method | Returns |
 |--------|---------|
-| `get_wallet(name)` | Wallet info |
-| `get_intent(wallet_name, index)` | Intent by index |
-| `list_intents(wallet_name)` | All intents |
-| `get_proposal(wallet_name, id)` | Proposal by ID |
-| `list_proposals(wallet_name)` | All proposals |
-| `get_proposal_message(wallet_name, id)` | The human-readable message |
+| `get_wallet(name)` | Wallet info (owner, storage, allowed tokens) |
+| `get_intent(wallet, index)` | Intent by index |
+| `list_intents(wallet)` | All intents |
+| `get_proposal(wallet, id)` | Proposal by ID |
+| `list_proposals(wallet)` | All proposals |
+| `get_proposal_message(wallet, id)` | The human-readable message |
+| `get_wallet_near_balance(wallet)` | Tracked NEAR balance |
+| `get_ft_balance(wallet, token)` | Tracked FT balance |
+| `get_allowed_tokens(wallet)` | Token allowlist |
+| `get_delegation(wallet, intent, idx)` | Delegate for approver slot |
+| `get_event_nonce()` | Current event counter |
 
 ## Built-in Executions
 
 | Intent Name | Parameters | Action |
 |-------------|-----------|--------|
-| `Transfer NEAR` | `amount` (U128), `recipient` (AccountId) | Sends yoctoNEAR |
-| `Transfer FT` | `token` (AccountId), `amount` (U128 string), `recipient` (AccountId) | Calls `ft_transfer` |
+| `Transfer NEAR` | `amount` (U128), `recipient` (AccountId) | Sends yoctoNEAR from wallet balance |
+| `Transfer FT` | `token` (AccountId), `amount` (U128), `recipient` (AccountId) | Calls `ft_transfer`, debits tracked balance |
+| `Deposit NEAR` | `amount` (U128) | Credits attached deposit to wallet balance |
+| Custom (any other name) | Any params | Emits `custom_execution` event |
 
-Custom intent names that don't match emit an event:
+## Events
+
+All state changes emit NEP-297 compliant events with monotonic nonces:
+
 ```json
 {
   "standard": "clear-msig",
   "version": "1.0.0",
-  "event": "custom_execution",
-  "data": { "wallet": "...", "intent": "...", "params": {} }
+  "event": "transfer_near",
+  "nonce": 42,
+  "data": {
+    "wallet": "treasury",
+    "recipient": "bob.near",
+    "amount": "1000000000000000000000000"
+  }
 }
 ```
 
+| Event | Trigger |
+|-------|---------|
+| `wallet_created` | Wallet created |
+| `wallet_deleted` | Wallet deleted |
+| `ownership_transferred` | Owner changed |
+| `token_allowed` | FT added to allowlist |
+| `intent_added_via_proposal` | Intent added via AddIntent proposal |
+| `intent_removed` | Intent deactivated |
+| `intent_updated` | Intent modified |
+| `proposal_created` | Proposal created |
+| `proposal_amended` | Proposal amended |
+| `proposal_approved` | Approval threshold reached |
+| `proposal_cancelled` | Cancellation threshold reached |
+| `proposal_executed` | Proposal executed |
+| `proposal_cleaned` | Proposal removed from storage |
+| `transfer_near` | NEAR transferred |
+| `transfer_ft` | FT transferred |
+| `near_deposited` | NEAR deposited to wallet |
+| `ft_received` | FT received by wallet |
+| `delegation_set` | Approver delegated |
+| `delegation_revoked` | Delegation removed |
+
 ## Message Building Reference
-
-Messages are built from the intent template with parameters substituted:
-
-```
-expires <unix_seconds>.<nanoseconds>: <action> <rendered_template> | wallet: <name> proposal: <id>
-```
 
 ### Template Rendering
 
@@ -250,15 +261,36 @@ Placeholders `{param_name}` are replaced with parameter values:
 |--------|---------|
 | `propose` | Creating a proposal |
 | `approve` | Approving a proposal |
+| `cancel` | Cancel-voting a proposal |
+| `amend` | Amending a proposal |
 
-## Security Considerations
+## Threat Model
 
-1. **U128 precision**: Always pass `U128` params as strings (`"1000000000000000000000000"`). JavaScript `Number` loses precision above 2^53.
-2. **Message unambiguous**: Each message includes the wallet name and proposal ID, preventing replay across wallets or proposals.
-3. **Expiry**: Proposals and signatures include expiry timestamps. Expired proposals can't be approved or executed.
-4. **Vote switching**: Approving clears any prior cancellation vote for that approver, and vice versa.
-5. **Timelock**: Optional delay between approval and execution gives time for cancellation.
-6. **Max values**: Intent params can define `max_value` for U64/U128 types to limit proposals.
+### Protected against
+
+- Blind signing / opaque transactions
+- Parameter tampering (signed into message)
+- Cross-wallet / cross-proposal replay
+- Expired signature reuse
+- Unauthorized proposals (pubkey verified)
+- Cross-contract call attacks (`assert_direct_call`)
+- Template injection (`|`, newlines rejected)
+- Intent schema drift (SHA-256 pinning)
+- Proposal spam (100 per intent, 1 year max expiry)
+- U128 precision loss (always strings)
+- Balance overdraft (checked before transfer)
+- Unauthorized cancellations (clear-signed)
+- FT griefing (token allowlist + storage accounting)
+- Owner bypass (no `add_intent`, all through governance)
+
+### Trust assumptions
+
+| Trust | Who |
+|-------|-----|
+| ed25519 is secure | Cryptography |
+| NEAR runtime verifies signatures | NEAR Protocol |
+| Approvers control their keys | Key management |
+| Contract logic is correct | **Needs audit** |
 
 ## Building & Deploying
 
@@ -266,87 +298,46 @@ Placeholders `{param_name}` are replaced with parameter values:
 # Build
 cd contract && cargo near build non-reproducible-wasm
 
-# Deploy (testnet)
+# Deploy + init (testnet)
 near contract deploy <contract-id> use-file target/near/clear_msig.wasm \
   without-init-call network-config testnet sign-with-keychain send
-
-# Initialize
 near call <contract-id> new --accountId <account-id> --networkId testnet
 ```
 
 ## Reference Implementation
 
-A TypeScript client library is included in `reference/index.ts`.
-
-### Install
-
-```bash
-npm install near-api-js
-```
-
-### Quick Start
+TypeScript client in `reference/index.ts`.
 
 ```typescript
-import { ClearMsig, nearToYocto } from './reference';
+import { ClearMsig, nearToYocto, expiryFromNow } from './reference';
 
-const client = new ClearMsig('clear-msig.kampouse.testnet', 'testnet');
+const client = new ClearMsig('cmsig.kampouse.testnet', 'testnet');
 
-// Create wallet
+// Create wallet (0.5 NEAR deposit)
 await client.createWallet(account, 'treasury');
 
-// Add a transfer intent
-await client.addIntent(account, 'treasury', {
-  intent_type: 'Custom',
-  name: 'Transfer NEAR',
-  template: 'transfer {amount} yoctoNEAR to {recipient}',
-  proposers: ['alice.testnet'],
-  approvers: ['alice.testnet', 'bob.testnet'],
-  approval_threshold: 2,
-  cancellation_threshold: 1,
-  timelock_seconds: 0,
-  params: [
-    { name: 'amount', param_type: 'U128', max_value: null },
-    { name: 'recipient', param_type: 'AccountId', max_value: null },
-  ],
-});
-
-// Propose
+// Propose transfer
 const { proposalId, message } = await client.propose(
   'treasury', 3,
   { amount: nearToYocto('1.5'), recipient: 'bob.testnet' },
   keyPair, account,
-  { expiresAtNs: BigInt(Date.now() + 86400000) * BigInt(1_000_000) },
+  { expiresAtNs: expiryFromNow(86400) },
 );
-console.log('Message to sign:', message);
 
 // Approve
 await client.approve('treasury', proposalId, 0, bobKeyPair, account, {
-  expiresAtNs: BigInt(Date.now() + 86400000) * BigInt(1_000_000),
+  expiresAtNs: expiryFromNow(86400),
 });
 
 // Execute
 await client.execute(account, 'treasury', proposalId);
 ```
 
-### API
-
-| Function | Description |
-|----------|-------------|
-| `buildMessage(wallet, index, expires, action, intent, params)` | Build the human-readable message |
-| `signMessage(keyPair, message)` | Sign a message, returns hex signature |
-| `publicKeyToHex(keyPair)` | Get hex public key (no prefix) |
-| `renderTemplate(template, defs, params)` | Render intent template with params |
-| `u128(value)` | Safe U128 string from number/string/BigInt |
-| `nearToYocto(near)` | Convert NEAR to yoctoNEAR string |
-| `yoctoToNear(yocto)` | Convert yoctoNEAR to NEAR string |
-
 ### Example
 
 ```bash
 npx ts-node examples/full-flow.ts
 ```
-
-Runs through message building, signing, approve flow, and U128 safety demos.
 
 ## Project Structure
 
@@ -355,10 +346,11 @@ clear-msig/
 ├── contract/
 │   └── src/
 │       ├── lib.rs       # Contract state, wallet/intent/proposal CRUD
-│       ├── execute.rs   # Proposal execution (NEAR transfer, FT transfer, custom events)
+│       ├── execute.rs   # Proposal execution (NEAR, FT, deposit, custom)
+│       ├── ft.rs        # NEP-141 receiver, balance tracking, allowlist
 │       └── message.rs   # Clear-signing message builder & ed25519 verification
 ├── reference/
-│   └── index.ts         # TypeScript client library (reference implementation)
+│   └── index.ts         # TypeScript client (reference implementation)
 ├── examples/
 │   └── full-flow.ts     # Full flow demo
 └── README.md
