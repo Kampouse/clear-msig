@@ -1,0 +1,659 @@
+{
+  "schema_version": "0.4.0",
+  "metadata": {
+    "name": "clear-msig",
+    "version": "0.1.0",
+    "build": {
+      "compiler": "rustc 1.86.0",
+      "builder": "cargo-near cargo-near-build 0.11.1"
+    },
+    "wasm_hash": "51VX2HiFTQErELC9z8SeZSZ3CE3FSuMFhuvCkkPtuEi1"
+  },
+  "body": {
+    "functions": [
+      {
+        "name": "add_intent",
+        "doc": " Add a custom intent directly (owner only)",
+        "kind": "call",
+        "params": {
+          "serialization_type": "json",
+          "args": [
+            {
+              "name": "wallet_name",
+              "type_schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "intent",
+              "type_schema": {
+                "$ref": "#/definitions/Intent"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "approve",
+        "doc": " Approve a proposal",
+        "kind": "call",
+        "params": {
+          "serialization_type": "json",
+          "args": [
+            {
+              "name": "wallet_name",
+              "type_schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "proposal_id",
+              "type_schema": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            },
+            {
+              "name": "approver_index",
+              "type_schema": {
+                "type": "integer",
+                "format": "uint16",
+                "minimum": 0.0
+              }
+            },
+            {
+              "name": "signature",
+              "type_schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "expires_at",
+              "type_schema": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "cancel_vote",
+        "doc": " Cancel-vote a proposal",
+        "kind": "call",
+        "params": {
+          "serialization_type": "json",
+          "args": [
+            {
+              "name": "wallet_name",
+              "type_schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "proposal_id",
+              "type_schema": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            },
+            {
+              "name": "approver_index",
+              "type_schema": {
+                "type": "integer",
+                "format": "uint16",
+                "minimum": 0.0
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "cleanup",
+        "kind": "call",
+        "params": {
+          "serialization_type": "json",
+          "args": [
+            {
+              "name": "wallet_name",
+              "type_schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "proposal_id",
+              "type_schema": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "contract_source_metadata",
+        "kind": "view"
+      },
+      {
+        "name": "create_wallet",
+        "doc": " Create a new wallet with 3 meta-intents",
+        "kind": "call",
+        "params": {
+          "serialization_type": "json",
+          "args": [
+            {
+              "name": "name",
+              "type_schema": {
+                "type": "string"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "execute",
+        "kind": "call",
+        "params": {
+          "serialization_type": "json",
+          "args": [
+            {
+              "name": "wallet_name",
+              "type_schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "proposal_id",
+              "type_schema": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "get_intent",
+        "kind": "view",
+        "params": {
+          "serialization_type": "json",
+          "args": [
+            {
+              "name": "wallet_name",
+              "type_schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "index",
+              "type_schema": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0.0
+              }
+            }
+          ]
+        },
+        "result": {
+          "serialization_type": "json",
+          "type_schema": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/Intent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "get_proposal",
+        "kind": "view",
+        "params": {
+          "serialization_type": "json",
+          "args": [
+            {
+              "name": "wallet_name",
+              "type_schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "id",
+              "type_schema": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            }
+          ]
+        },
+        "result": {
+          "serialization_type": "json",
+          "type_schema": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/Proposal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "get_proposal_message",
+        "kind": "view",
+        "params": {
+          "serialization_type": "json",
+          "args": [
+            {
+              "name": "wallet_name",
+              "type_schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "id",
+              "type_schema": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            }
+          ]
+        },
+        "result": {
+          "serialization_type": "json",
+          "type_schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      {
+        "name": "get_wallet",
+        "kind": "view",
+        "params": {
+          "serialization_type": "json",
+          "args": [
+            {
+              "name": "name",
+              "type_schema": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "result": {
+          "serialization_type": "json",
+          "type_schema": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/Wallet"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      {
+        "name": "list_intents",
+        "kind": "view",
+        "params": {
+          "serialization_type": "json",
+          "args": [
+            {
+              "name": "wallet_name",
+              "type_schema": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "result": {
+          "serialization_type": "json",
+          "type_schema": {
+            "type": "array",
+            "items": {
+              "$ref": "#/definitions/Intent"
+            }
+          }
+        }
+      },
+      {
+        "name": "list_proposals",
+        "kind": "view",
+        "params": {
+          "serialization_type": "json",
+          "args": [
+            {
+              "name": "wallet_name",
+              "type_schema": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "result": {
+          "serialization_type": "json",
+          "type_schema": {
+            "type": "array",
+            "items": {
+              "$ref": "#/definitions/Proposal"
+            }
+          }
+        }
+      },
+      {
+        "name": "new",
+        "kind": "call",
+        "modifiers": [
+          "init"
+        ]
+      },
+      {
+        "name": "propose",
+        "doc": " Propose: create proposal with signed message",
+        "kind": "call",
+        "params": {
+          "serialization_type": "json",
+          "args": [
+            {
+              "name": "wallet_name",
+              "type_schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "intent_index",
+              "type_schema": {
+                "type": "integer",
+                "format": "uint32",
+                "minimum": 0.0
+              }
+            },
+            {
+              "name": "param_values",
+              "type_schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "expires_at",
+              "type_schema": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0.0
+              }
+            },
+            {
+              "name": "proposer_pubkey",
+              "type_schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "signature",
+              "type_schema": {
+                "type": "string"
+              }
+            }
+          ]
+        }
+      }
+    ],
+    "root_schema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "title": "String",
+      "type": "string",
+      "definitions": {
+        "Intent": {
+          "type": "object",
+          "required": [
+            "active",
+            "active_proposal_count",
+            "approval_threshold",
+            "approvers",
+            "cancellation_threshold",
+            "index",
+            "intent_type",
+            "name",
+            "params",
+            "proposers",
+            "template",
+            "timelock_seconds",
+            "wallet_name"
+          ],
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "active_proposal_count": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "approval_threshold": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "approvers": {
+              "type": "array",
+              "items": {
+                "description": "NEAR Account Identifier.\n\nThis is a unique, syntactically valid, human-readable account identifier on the NEAR network.\n\n[See the crate-level docs for information about validation.](index.html#account-id-rules)\n\nAlso see [Error kind precedence](AccountId#error-kind-precedence).\n\n## Examples\n\n``` use near_account_id::AccountId;\n\nlet alice: AccountId = \"alice.near\".parse().unwrap();\n\nassert!(\"ƒelicia.near\".parse::<AccountId>().is_err()); // (ƒ is not f) ```",
+                "type": "string"
+              }
+            },
+            "cancellation_threshold": {
+              "type": "integer",
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "intent_type": {
+              "$ref": "#/definitions/IntentType"
+            },
+            "name": {
+              "type": "string"
+            },
+            "params": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/ParamDef"
+              }
+            },
+            "proposers": {
+              "type": "array",
+              "items": {
+                "description": "NEAR Account Identifier.\n\nThis is a unique, syntactically valid, human-readable account identifier on the NEAR network.\n\n[See the crate-level docs for information about validation.](index.html#account-id-rules)\n\nAlso see [Error kind precedence](AccountId#error-kind-precedence).\n\n## Examples\n\n``` use near_account_id::AccountId;\n\nlet alice: AccountId = \"alice.near\".parse().unwrap();\n\nassert!(\"ƒelicia.near\".parse::<AccountId>().is_err()); // (ƒ is not f) ```",
+                "type": "string"
+              }
+            },
+            "template": {
+              "type": "string"
+            },
+            "timelock_seconds": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "wallet_name": {
+              "type": "string"
+            }
+          }
+        },
+        "IntentType": {
+          "type": "string",
+          "enum": [
+            "Custom",
+            "AddIntent",
+            "RemoveIntent",
+            "UpdateIntent"
+          ]
+        },
+        "ParamDef": {
+          "type": "object",
+          "required": [
+            "name",
+            "param_type"
+          ],
+          "properties": {
+            "max_value": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "param_type": {
+              "$ref": "#/definitions/ParamType"
+            }
+          }
+        },
+        "ParamType": {
+          "type": "string",
+          "enum": [
+            "AccountId",
+            "U64",
+            "U128",
+            "String",
+            "Bool"
+          ]
+        },
+        "Proposal": {
+          "type": "object",
+          "required": [
+            "approval_bitmap",
+            "approved_at",
+            "cancellation_bitmap",
+            "expires_at",
+            "id",
+            "intent_index",
+            "message",
+            "param_values",
+            "proposed_at",
+            "proposer",
+            "status",
+            "wallet_name"
+          ],
+          "properties": {
+            "approval_bitmap": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "approved_at": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "cancellation_bitmap": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "expires_at": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "id": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "intent_index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "message": {
+              "type": "string"
+            },
+            "param_values": {
+              "type": "string"
+            },
+            "proposed_at": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "proposer": {
+              "description": "NEAR Account Identifier.\n\nThis is a unique, syntactically valid, human-readable account identifier on the NEAR network.\n\n[See the crate-level docs for information about validation.](index.html#account-id-rules)\n\nAlso see [Error kind precedence](AccountId#error-kind-precedence).\n\n## Examples\n\n``` use near_account_id::AccountId;\n\nlet alice: AccountId = \"alice.near\".parse().unwrap();\n\nassert!(\"ƒelicia.near\".parse::<AccountId>().is_err()); // (ƒ is not f) ```",
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/definitions/ProposalStatus"
+            },
+            "wallet_name": {
+              "type": "string"
+            }
+          }
+        },
+        "ProposalStatus": {
+          "type": "string",
+          "enum": [
+            "Active",
+            "Approved",
+            "Executed",
+            "Cancelled"
+          ]
+        },
+        "Wallet": {
+          "type": "object",
+          "required": [
+            "created_at",
+            "intent_index",
+            "name",
+            "owner",
+            "proposal_index"
+          ],
+          "properties": {
+            "created_at": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "intent_index": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "name": {
+              "type": "string"
+            },
+            "owner": {
+              "description": "NEAR Account Identifier.\n\nThis is a unique, syntactically valid, human-readable account identifier on the NEAR network.\n\n[See the crate-level docs for information about validation.](index.html#account-id-rules)\n\nAlso see [Error kind precedence](AccountId#error-kind-precedence).\n\n## Examples\n\n``` use near_account_id::AccountId;\n\nlet alice: AccountId = \"alice.near\".parse().unwrap();\n\nassert!(\"ƒelicia.near\".parse::<AccountId>().is_err()); // (ƒ is not f) ```",
+              "type": "string"
+            },
+            "proposal_index": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            }
+          }
+        }
+      }
+    }
+  }
+}
