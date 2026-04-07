@@ -115,6 +115,10 @@ impl Intent {
                 },
                 None => continue,
             };
+            // Sanitize: reject values containing message format characters
+            assert!(!value.contains('|'), "Param {} contains invalid character '|'", param.name);
+            assert!(!value.contains('\n'), "Param {} contains newline", param.name);
+            assert!(!value.contains('\r'), "Param {} contains carriage return", param.name);
             result = result.replace(&placeholder, &value);
         }
         result
@@ -208,8 +212,11 @@ impl Contract {
 
     /// Create a new wallet with 3 meta-intents
     pub fn create_wallet(&mut self, name: String) {
+        assert_eq!(env::attached_deposit(), NearToken::from_yoctonear(0), "No deposit required");
         let predecessor = env::predecessor_account_id();
         assert!(self.wallets.get(&name).is_none(), "Wallet already exists");
+        assert!(!name.is_empty(), "Name cannot be empty");
+        assert!(name.len() <= 64, "Name too long (max 64 chars)");
 
         let wallet = Wallet {
             name: name.clone(),
@@ -221,6 +228,8 @@ impl Contract {
         self.wallets.insert(&name, &wallet);
 
         let pk = predecessor.clone();
+        // Validate approver count for meta-intents
+        // (meta-intents have 1 approver, so always valid, but future-proof)
         // Meta-intent 0: AddIntent
         self.intents.insert(
             &intent_key(&name, 0),
@@ -282,10 +291,15 @@ impl Contract {
         log!("Wallet '{}' created", name);
     }
 
-    /// Add a custom intent directly (owner only)
+    /// Add a custom intent via governance (requires approved AddIntent proposal)
+    /// Direct owner add is also supported for bootstrapping
     pub fn add_intent(&mut self, wallet_name: String, intent: Intent) {
         let mut wallet = self.wallets.get(&wallet_name).expect("Wallet not found");
-        assert_eq!(env::predecessor_account_id(), wallet.owner, "Only owner");
+        let caller = env::predecessor_account_id();
+        assert!(caller == wallet.owner, "Only owner can add intents directly");
+        assert!(intent.approvers.len() <= 64, "Max 64 approvers (bitmap limit)");
+        assert!(intent.approval_threshold as usize <= intent.approvers.len(), "Threshold exceeds approvers");
+        assert!(intent.cancellation_threshold as usize <= intent.approvers.len(), "Cancellation threshold exceeds approvers");
 
         let index = wallet.intent_index;
         let key = intent_key(&wallet_name, index);
@@ -328,11 +342,18 @@ impl Contract {
 
         message::verify_signature(&proposer_pubkey, &signature, &msg);
 
+        // Verify the pubkey belongs to the signer (prevents forged signatures)
+        let signer_pk = env::signer_account_pk();
+        let signer_pk_bytes = signer_pk.into_bytes();
+        let signer_pk_raw = if signer_pk_bytes.len() == 33 { &signer_pk_bytes[1..] } else { &signer_pk_bytes[..] };
+        let signer_pk_hex = hex_encode(signer_pk_raw);
+        assert_eq!(proposer_pubkey, signer_pk_hex, "Signer pubkey mismatch");
+
         let proposal = Proposal {
             id: proposal_index,
             wallet_name: wallet_name.clone(),
             intent_index,
-            proposer,
+            proposer: proposer.clone(),
             status: ProposalStatus::Active,
             proposed_at: env::block_timestamp(),
             approved_at: 0,
@@ -340,7 +361,7 @@ impl Contract {
             approval_bitmap: 0,
             cancellation_bitmap: 0,
             param_values,
-            message: msg,
+            message: msg.clone(),
         };
 
         let pkey = proposal_key(&wallet_name, proposal_index);
@@ -353,6 +374,19 @@ impl Contract {
 
         wallet.proposal_index = proposal_index + 1;
         self.wallets.insert(&wallet_name, &wallet);
+
+        env::log_str(&format!("EVENT_JSON:{}", serde_json::json!({
+            "standard": "clear-msig",
+            "version": "1.0.0",
+            "event": "proposal_created",
+            "data": {
+                "wallet": wallet_name,
+                "proposal_id": proposal_index,
+                "intent_index": intent_index,
+                "proposer": proposer.to_string(),
+                "message": msg,
+            }
+        })));
 
         log!("Proposal #{} created for intent #{}", proposal_index, intent_index);
     }
@@ -370,6 +404,7 @@ impl Contract {
         let pkey = proposal_key(&wallet_name, proposal_id);
         let mut proposal = self.proposals.get(&pkey).expect("Proposal not found");
         assert!(proposal.status == ProposalStatus::Active, "Not active");
+        assert!(proposal.expires_at > env::block_timestamp(), "Proposal expired");
         assert!(expires_at > env::block_timestamp(), "Signature expired");
 
         let ikey = intent_key(&wallet_name, proposal.intent_index);
@@ -392,6 +427,18 @@ impl Contract {
         if proposal.approval_count() >= intent.approval_threshold as u32 {
             proposal.status = ProposalStatus::Approved;
             proposal.approved_at = env::block_timestamp();
+
+            env::log_str(&format!("EVENT_JSON:{}", serde_json::json!({
+                "standard": "clear-msig",
+                "version": "1.0.0",
+                "event": "proposal_approved",
+                "data": {
+                    "wallet": wallet_name,
+                    "proposal_id": proposal_id,
+                    "approval_count": proposal.approval_count(),
+                }
+            })));
+
             log!("Proposal #{} approved", proposal_id);
         }
 
