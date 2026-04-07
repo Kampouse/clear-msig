@@ -5,13 +5,9 @@ use crate::*;
 #[near_bindgen]
 impl Contract {
     /// Execute an approved proposal after timelock has elapsed.
-    /// Rejects attached deposits — contract holds its own balance.
+    /// Accepts deposits for "Deposit NEAR" intent; rejects otherwise.
+    #[payable]
     pub fn execute(&mut self, wallet_name: String, proposal_id: u64) {
-        assert_eq!(
-            env::attached_deposit().as_yoctonear(),
-            0,
-            "ERR_NO_DEPOSIT_ON_EXECUTE"
-        );
 
         let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         let pkey = proposal_key(&wallet_name, proposal_id);
@@ -224,6 +220,8 @@ impl Contract {
                     .or_else(|| params.get("amount").and_then(|v| v.as_u64()).map(|v| v as u128))
                     .expect("ERR_MISSING_AMOUNT");
 
+                // Debit from wallet's tracked balance
+                self.debit_near(&wallet.name, amount);
                 Promise::new(recipient.clone()).transfer(NearToken::from_yoctonear(amount));
 
                 self.emit("transfer_near", serde_json::json!({
@@ -242,10 +240,11 @@ impl Contract {
                     .parse().expect("ERR_INVALID_RECIPIENT");
                 let amount = params
                     .get("amount").and_then(|v| v.as_str()).expect("ERR_MISSING_AMOUNT");
-                // Validate amount parses as U128
                 amount.parse::<u128>().expect("ERR_INVALID_FT_AMOUNT");
 
-                // Use serde_json for safe serialization (fixes #8: string format JSON is fragile)
+                // Debit from wallet's tracked FT balance
+                self.debit_ft(&wallet.name, token.as_ref(), amount.parse::<u128>().unwrap());
+
                 let payload = safe_json_ft_transfer(recipient.as_ref(), amount);
                 Promise::new(token.clone()).function_call(
                     "ft_transfer".to_string(),
@@ -259,6 +258,18 @@ impl Contract {
                     "token": token.to_string(),
                     "recipient": recipient.to_string(),
                     "amount": amount,
+                }));
+            }
+
+            "Deposit NEAR" | "deposit_near" => {
+                // Credit NEAR to wallet from attached deposit
+                let amount = env::attached_deposit().as_yoctonear();
+                assert!(amount > 0, "ERR_NO_DEPOSIT");
+                self.credit_near(&wallet.name, amount);
+
+                self.emit("near_deposited", serde_json::json!({
+                    "wallet": wallet.name,
+                    "amount": amount.to_string(),
                 }));
             }
 

@@ -3,10 +3,11 @@ use near_sdk::collections::LookupMap;
 use near_sdk::json_types::U128;
 use near_sdk::{
     env, log, near, near_bindgen, AccountId, BorshStorageKey, NearToken,
-    PanicOnDefault, Promise,
+    PanicOnDefault, Promise, PromiseOrValue,
 };
 
 mod execute;
+mod ft;
 mod message;
 
 use message::hex_encode;
