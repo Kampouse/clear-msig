@@ -14,6 +14,11 @@ use message::hex_encode;
 
 pub type Balance = u128;
 
+/// Maximum proposal expiry: 1 year from now (in nanoseconds)
+const MAX_EXPIRY_NS: u64 = 365 * 24 * 60 * 60 * 1_000_000_000;
+/// Maximum active proposals per intent
+const MAX_ACTIVE_PROPOSALS: u32 = 100;
+
 // ── Storage Keys ──────────────────────────────────────────────────────────
 
 #[derive(BorshSerialize, BorshStorageKey)]
@@ -140,6 +145,9 @@ pub struct Proposal {
     pub cancellation_bitmap: u64,
     pub param_values: String,
     pub message: String,
+    /// Hash of the intent's params schema at proposal time.
+    /// Prevents execution if intent params were changed after proposal.
+    pub intent_params_hash: String,
 }
 
 impl Proposal {
@@ -188,6 +196,23 @@ fn proposal_key(wallet: &str, id: u64) -> String {
     format!("{}:p:{}", wallet, id)
 }
 
+/// Hash params schema to detect changes between proposal and execution
+fn hash_params(params: &[ParamDef]) -> String {
+    use near_sdk::borsh::BorshSerialize;
+    let mut data = Vec::new();
+    near_sdk::borsh::BorshSerialize::serialize(params, &mut data).unwrap_or_else(|_| env::panic_str("Failed to serialize params"));
+    let hash = env::sha256(&data);
+    hash.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Assert that the call is direct from a user (not a cross-contract call).
+/// Prevents malicious contracts from proposing/approving on behalf of users.
+fn assert_direct_call() {
+    let signer = env::signer_account_id();
+    let predecessor = env::predecessor_account_id();
+    assert_eq!(signer, predecessor, "Direct call required (no cross-contract calls)");
+}
+
 // ── Contract ───────────────────────────────────────────────────────────────
 
 #[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
@@ -228,8 +253,6 @@ impl Contract {
         self.wallets.insert(&name, &wallet);
 
         let pk = predecessor.clone();
-        // Validate approver count for meta-intents
-        // (meta-intents have 1 approver, so always valid, but future-proof)
         // Meta-intent 0: AddIntent
         self.intents.insert(
             &intent_key(&name, 0),
@@ -300,6 +323,7 @@ impl Contract {
         assert!(intent.approvers.len() <= 64, "Max 64 approvers (bitmap limit)");
         assert!(intent.approval_threshold as usize <= intent.approvers.len(), "Threshold exceeds approvers");
         assert!(intent.cancellation_threshold as usize <= intent.approvers.len(), "Cancellation threshold exceeds approvers");
+        assert!(!intent.params.is_empty(), "Intent must have at least one param definition");
 
         let index = wallet.intent_index;
         let key = intent_key(&wallet_name, index);
@@ -325,6 +349,8 @@ impl Contract {
         proposer_pubkey: String,
         signature: String,
     ) {
+        assert_direct_call();
+
         let proposer = env::predecessor_account_id();
         let mut wallet = self.wallets.get(&wallet_name).expect("Wallet not found");
         let ikey = intent_key(&wallet_name, intent_index);
@@ -333,6 +359,15 @@ impl Contract {
         assert!(intent.active, "Intent inactive");
         assert!(intent.is_proposer(&proposer) || proposer == wallet.owner, "Not a proposer");
         assert!(expires_at > env::block_timestamp(), "Must expire in future");
+        assert!(
+            expires_at <= env::block_timestamp() + MAX_EXPIRY_NS,
+            "Expiry too far in future (max 1 year)"
+        );
+        assert!(
+            intent.active_proposal_count < MAX_ACTIVE_PROPOSALS,
+            "Max active proposals reached for this intent ({})",
+            MAX_ACTIVE_PROPOSALS
+        );
 
         let params: serde_json::Value = serde_json::from_str(&param_values).expect("Invalid JSON");
         self.validate_params(&intent, &params);
@@ -349,6 +384,8 @@ impl Contract {
         let signer_pk_hex = hex_encode(signer_pk_raw);
         assert_eq!(proposer_pubkey, signer_pk_hex, "Signer pubkey mismatch");
 
+        let intent_params_hash = hash_params(&intent.params);
+
         let proposal = Proposal {
             id: proposal_index,
             wallet_name: wallet_name.clone(),
@@ -362,6 +399,7 @@ impl Contract {
             cancellation_bitmap: 0,
             param_values,
             message: msg.clone(),
+            intent_params_hash,
         };
 
         let pkey = proposal_key(&wallet_name, proposal_index);
@@ -400,6 +438,8 @@ impl Contract {
         signature: String,
         expires_at: u64,
     ) {
+        assert_direct_call();
+
         let approver = env::predecessor_account_id();
         let pkey = proposal_key(&wallet_name, proposal_id);
         let mut proposal = self.proposals.get(&pkey).expect("Proposal not found");
@@ -445,16 +485,37 @@ impl Contract {
         self.proposals.insert(&pkey, &proposal);
     }
 
-    /// Cancel-vote a proposal
-    pub fn cancel_vote(&mut self, wallet_name: String, proposal_id: u64, approver_index: u16) {
+    /// Cancel-vote a proposal (requires clear-signed message)
+    pub fn cancel_vote(
+        &mut self,
+        wallet_name: String,
+        proposal_id: u64,
+        approver_index: u16,
+        signature: String,
+        expires_at: u64,
+    ) {
+        assert_direct_call();
+
         let approver = env::predecessor_account_id();
         let pkey = proposal_key(&wallet_name, proposal_id);
         let mut proposal = self.proposals.get(&pkey).expect("Proposal not found");
         assert!(proposal.status == ProposalStatus::Active, "Not active");
+        assert!(proposal.expires_at > env::block_timestamp(), "Proposal expired");
+        assert!(expires_at > env::block_timestamp(), "Signature expired");
 
         let ikey = intent_key(&wallet_name, proposal.intent_index);
         let mut intent = self.intents.get(&ikey).expect("Intent not found");
+        assert!((approver_index as usize) < intent.approvers.len(), "Invalid index");
         assert_eq!(intent.approvers[approver_index as usize], approver, "Approver mismatch");
+
+        // Verify clear-signed cancel message
+        let params: serde_json::Value = serde_json::from_str(&proposal.param_values).unwrap_or_default();
+        let msg = message::build_message(&wallet_name, proposal_id, expires_at, "cancel", &intent, &params);
+        let pk = env::signer_account_pk();
+        let pk_bytes = pk.into_bytes();
+        let pk_raw = if pk_bytes.len() == 33 { &pk_bytes[1..] } else { &pk_bytes[..] };
+        let pk_hex = hex_encode(pk_raw);
+        message::verify_signature(&pk_hex, &signature, &msg);
 
         proposal.set_cancellation(approver_index as usize);
 
@@ -462,6 +523,17 @@ impl Contract {
             proposal.status = ProposalStatus::Cancelled;
             intent.active_proposal_count = intent.active_proposal_count.saturating_sub(1);
             self.intents.insert(&ikey, &intent);
+
+            env::log_str(&format!("EVENT_JSON:{}", serde_json::json!({
+                "standard": "clear-msig",
+                "version": "1.0.0",
+                "event": "proposal_cancelled",
+                "data": {
+                    "wallet": wallet_name,
+                    "proposal_id": proposal_id,
+                    "cancellation_count": proposal.cancellation_count(),
+                }
+            })));
         }
 
         self.proposals.insert(&pkey, &proposal);

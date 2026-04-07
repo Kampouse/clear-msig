@@ -79,7 +79,7 @@ export function buildMessage(
   walletName: string,
   proposalIndex: number,
   expiresAt: bigint, // nanoseconds
-  action: 'propose' | 'approve',
+  action: 'propose' | 'approve' | 'cancel',
   intent: Intent,
   params: ProposeParams,
 ): string {
@@ -410,14 +410,45 @@ export class ClearMsig {
   }
 
   /**
-   * Cancel-vote a proposal.
+   * Cancel-vote a proposal (requires clear-signed message).
+   *
+   * @example
+   * ```ts
+   * await client.cancelVote('treasury', 0, 0, keyPair, account, {
+   *   expiresAtNs: BigInt(Date.now() + 86400000) * BigInt(1_000_000),
+   * });
+   * ```
    */
   async cancelVote(
-    account: any,
     walletName: string,
     proposalId: number,
     approverIndex: number,
-  ): Promise<void> {
+    keyPair: KeyPair,
+    account: any,
+    options: { expiresAtNs: bigint },
+  ): Promise<{ message: string }> {
+    // Fetch proposal and intent to build cancel message
+    const proposal = await this.getProposal(account, walletName, proposalId);
+    if (!proposal) throw new Error(`Proposal #${proposalId} not found`);
+
+    const intent = await this.getIntent(account, walletName, proposal.intent_index);
+    if (!intent) throw new Error('Intent not found');
+
+    const params: ProposeParams = JSON.parse(proposal.param_values);
+
+    // Build cancel message
+    const message = buildMessage(
+      walletName,
+      proposalId,
+      options.expiresAtNs,
+      'cancel',
+      intent,
+      params,
+    );
+
+    // Sign
+    const signature = signMessage(keyPair, message);
+
     await account.functionCall({
       contractId: this.contractId,
       methodName: 'cancel_vote',
@@ -425,8 +456,13 @@ export class ClearMsig {
         wallet_name: walletName,
         proposal_id: proposalId,
         approver_index: approverIndex,
+        signature,
+        expires_at: options.expiresAtNs.toString(),
       },
+      gas: new utils.format.Gas('100').intoGas(),
     });
+
+    return { message };
   }
 
   /**

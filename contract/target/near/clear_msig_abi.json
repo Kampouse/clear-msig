@@ -7,7 +7,7 @@
       "compiler": "rustc 1.86.0",
       "builder": "cargo-near cargo-near-build 0.11.1"
     },
-    "wasm_hash": "92nK9r7emNVEJhQDeRhAkZ4jmAMPx65UGKZLWZFFFYzX"
+    "wasm_hash": "PUCTCJUjKvy6FEc1fYACJoxX4NGAyyzN862wYFpDUeN"
   },
   "body": {
     "functions": [
@@ -81,7 +81,7 @@
       },
       {
         "name": "cancel_vote",
-        "doc": " Cancel-vote a proposal",
+        "doc": " Cancel-vote a proposal (requires clear-signed message)",
         "kind": "call",
         "params": {
           "serialization_type": "json",
@@ -105,6 +105,20 @@
               "type_schema": {
                 "type": "integer",
                 "format": "uint16",
+                "minimum": 0.0
+              }
+            },
+            {
+              "name": "signature",
+              "type_schema": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "expires_at",
+              "type_schema": {
+                "type": "integer",
+                "format": "uint64",
                 "minimum": 0.0
               }
             }
@@ -549,6 +563,7 @@
             "expires_at",
             "id",
             "intent_index",
+            "intent_params_hash",
             "message",
             "param_values",
             "proposed_at",
@@ -586,6 +601,10 @@
               "type": "integer",
               "format": "uint32",
               "minimum": 0.0
+            },
+            "intent_params_hash": {
+              "description": "Hash of the intent's params schema at proposal time. Prevents execution if intent params were changed after proposal.",
+              "type": "string"
             },
             "message": {
               "type": "string"

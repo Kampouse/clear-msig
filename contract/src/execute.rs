@@ -21,6 +21,17 @@ impl Contract {
 
         let params: serde_json::Value = serde_json::from_str(&proposal.param_values).expect("Invalid JSON");
 
+        // Re-validate params against current intent schema
+        // This catches cases where intent params changed after proposal
+        self.validate_params(&intent, &params);
+
+        // Verify intent params haven't changed since proposal was created
+        let current_hash = hash_params(&intent.params);
+        assert_eq!(
+            proposal.intent_params_hash, current_hash,
+            "Intent params changed after proposal — proposal invalidated"
+        );
+
         match intent.intent_type {
             IntentType::AddIntent => self.execute_add_intent(&mut wallet, &wallet_name, &params),
             IntentType::RemoveIntent => self.execute_remove_intent(&wallet_name, &params),
