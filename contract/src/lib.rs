@@ -209,7 +209,15 @@ pub struct Wallet {
     pub storage_deposit: u128,
     /// Actual storage used (bytes), tracked for accurate refunds
     pub storage_used: u64,
+    /// Tokens allowed to be received via ft_on_transfer.
+    /// Empty = accept all (open), non-empty = allowlist only.
+    pub allowed_tokens: Vec<AccountId>,
+    /// Number of unique FT tokens tracked (for storage accounting)
+    pub ft_token_count: u32,
 }
+
+/// Storage cost per FT token entry (key + u128 value ≈ 100 bytes)
+const FT_ENTRY_STORAGE_BYTES: u64 = 100;
 
 // ── Composite keys ─────────────────────────────────────────────────────────
 
@@ -319,7 +327,9 @@ impl Contract {
             intent_index: 3,
             created_at: env::block_timestamp(),
             storage_deposit: deposit.as_yoctonear(),
-            storage_used: 0, // will be set after writes
+            storage_used: 0,
+            allowed_tokens: Vec::new(),
+            ft_token_count: 0,
         };
         self.wallets.insert(&name, &wallet);
         self.create_meta_intents(&name, &predecessor);
@@ -434,32 +444,47 @@ impl Contract {
 
     // ── Intent Management ──────────────────────────────────────────────
 
-    pub fn add_intent(&mut self, wallet_name: String, intent: Intent) {
+    /// Add a token to the wallet's FT allowlist. Owner only.
+    /// Empty allowlist = accept all tokens.
+    /// Once you add the first token, only listed tokens are accepted.
+    pub fn add_allowed_token(&mut self, wallet_name: String, token: AccountId) {
+        assert_direct_call();
         let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         assert_eq!(env::predecessor_account_id(), wallet.owner, "ERR_NOT_OWNER");
-        self.validate_intent(&intent);
-
-        let index = wallet.intent_index;
-        let mut i = intent;
-        i.wallet_name = wallet_name.clone();
-        i.index = index;
-        i.active = true;
-        i.active_proposal_count = 0;
-        if i.execution_gas_tgas == 0 {
-            i.execution_gas_tgas = DEFAULT_EXECUTION_GAS_TGAS;
-        }
-        self.intents.insert(&intent_key(&wallet_name, index), &i);
-
-        wallet.intent_index = index + 1;
+        assert!(
+            !wallet.allowed_tokens.contains(&token),
+            "ERR_TOKEN_ALREADY_ALLOWED"
+        );
+        wallet.allowed_tokens.push(token.clone());
         self.wallets.insert(&wallet_name, &wallet);
 
-        self.emit("intent_added", serde_json::json!({
+        self.emit("token_allowed", serde_json::json!({
             "wallet": wallet_name,
-            "index": index,
-            "name": i.name,
+            "token": token.to_string(),
         }));
 
-        log!("Intent #{} added to '{}'", index, wallet_name);
+        log!("Token '{}' allowed for wallet '{}'", token, wallet_name);
+    }
+
+    /// Remove a token from the wallet's FT allowlist. Owner only.
+    pub fn remove_allowed_token(&mut self, wallet_name: String, token: AccountId) {
+        assert_direct_call();
+        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        assert_eq!(env::predecessor_account_id(), wallet.owner, "ERR_NOT_OWNER");
+        let original_len = wallet.allowed_tokens.len();
+        wallet.allowed_tokens.retain(|t| t != &token);
+        assert!(
+            wallet.allowed_tokens.len() < original_len,
+            "ERR_TOKEN_NOT_IN_LIST"
+        );
+        self.wallets.insert(&wallet_name, &wallet);
+
+        self.emit("token_removed_from_allowlist", serde_json::json!({
+            "wallet": wallet_name,
+            "token": token.to_string(),
+        }));
+
+        log!("Token '{}' removed from allowlist for '{}'", token, wallet_name);
     }
 
     pub fn delegate_approver(
@@ -659,6 +684,12 @@ impl Contract {
 
     pub fn get_proposal_message(&self, wallet_name: String, id: u64) -> Option<String> {
         self.proposals.get(&proposal_key(&wallet_name, id)).map(|p| p.message)
+    }
+
+    pub fn get_allowed_tokens(&self, wallet_name: String) -> Vec<AccountId> {
+        self.wallets.get(&wallet_name)
+            .map(|w| w.allowed_tokens)
+            .unwrap_or_default()
     }
 
     pub fn get_delegation(&self, wallet_name: String, intent_index: u32, approver_index: u16) -> Option<AccountId> {

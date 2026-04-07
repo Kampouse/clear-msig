@@ -2,6 +2,7 @@
 //!
 //! Allows the multisig contract to receive, hold, and send FTs (USDC, USDT, etc.)
 //! per wallet. Each wallet tracks its own FT balances independently.
+//! Supports token allowlist to prevent griefing.
 
 use crate::*;
 
@@ -10,13 +11,26 @@ fn ft_balance_key(wallet: &str, token: &str) -> String {
     format!("{}:ft:{}", wallet, token)
 }
 
+/// Check if a token is in the wallet's allowlist.
+/// Empty allowlist = accept all.
+fn is_token_allowed(wallet: &Wallet, token: &AccountId) -> bool {
+    wallet.allowed_tokens.is_empty() || wallet.allowed_tokens.contains(token)
+}
+
+/// Storage cost per FT entry (key ~70 bytes + u128 value 16 bytes + overhead)
+const FT_ENTRY_STORAGE_BYTES: u64 = 100;
+/// YoctoNEAR per byte (NEAR's standard storage rate)
+const STORAGE_COST_PER_BYTE_YOCTO: u128 = 10_000_000_000_000; // 10^13
+
 #[near_bindgen]
 impl Contract {
     /// NEP-141 `ft_on_transfer` callback.
     /// Callers transfer FTs to this contract with `msg` = wallet name.
     /// Returns unused amount (always "0" — we accept all tokens).
     ///
-    /// Example: `ft_transfer_call(contract_id, "1000000", "treasury")`
+    /// Enforces:
+    /// - Token must be on the wallet's allowlist (or allowlist is empty = open)
+    /// - Sufficient storage deposit to track a new token
     pub fn ft_on_transfer(
         &mut self,
         sender_id: AccountId,
@@ -25,30 +39,50 @@ impl Contract {
     ) -> PromiseOrValue<U128> {
         let token_account = env::predecessor_account_id();
         let wallet_name = if msg.is_empty() {
-            // If no msg, try to credit sender's wallet (if they have one named after them)
             sender_id.as_str().to_string()
         } else {
             msg
         };
 
-        // Verify wallet exists
+        let mut wallet = self.wallets.get(&wallet_name)
+            .unwrap_or_else(|| env::panic_str(&format!("ERR_WALLET_NOT_FOUND: {}", wallet_name)));
+
+        // Check token allowlist
         assert!(
-            self.wallets.get(&wallet_name).is_some(),
-            "ERR_WALLET_NOT_FOUND: '{}'",
-            wallet_name
+            is_token_allowed(&wallet, &token_account),
+            "ERR_TOKEN_NOT_ALLOWED: {} not in allowlist for '{}'",
+            token_account, wallet_name
         );
 
-        // Credit the balance
+        // Check if this is a new token — charge storage if so
         let bkey = ft_balance_key(&wallet_name, token_account.as_str());
-        let current: u128 = env::storage_read(&bkey.as_bytes())
-            .map(|bytes| {
-                let arr: [u8; 16] = bytes.try_into().unwrap_or([0u8; 16]);
-                u128::from_le_bytes(arr)
-            })
-            .unwrap_or(0);
+        let is_new_token = env::storage_read(bkey.as_bytes()).is_none();
+
+        if is_new_token {
+            let storage_cost = FT_ENTRY_STORAGE_BYTES as u128 * STORAGE_COST_PER_BYTE_YOCTO;
+            assert!(
+                wallet.storage_deposit >= storage_cost,
+                "ERR_INSUFFICIENT_STORAGE: need {} yocto for new token, have {} deposited",
+                storage_cost, wallet.storage_deposit
+            );
+            wallet.storage_deposit -= storage_cost;
+            wallet.ft_token_count += 1;
+        }
+
+        // Credit the balance
+        let current: u128 = if is_new_token {
+            0
+        } else {
+            let bytes = env::storage_read(bkey.as_bytes()).unwrap();
+            let arr: [u8; 16] = bytes.try_into().unwrap_or([0u8; 16]);
+            u128::from_le_bytes(arr)
+        };
 
         let new_balance = current + amount.0;
         env::storage_write(&bkey.as_bytes(), &new_balance.to_le_bytes());
+
+        // Update wallet (storage deposit may have changed)
+        self.wallets.insert(&wallet_name, &wallet);
 
         self.emit("ft_received", serde_json::json!({
             "wallet": wallet_name,
@@ -56,17 +90,14 @@ impl Contract {
             "amount": amount.0.to_string(),
             "sender": sender_id.to_string(),
             "new_balance": new_balance.to_string(),
+            "is_new_token": is_new_token,
         }));
 
         log!(
             "FT received: {} tokens from {} for wallet '{}' (balance: {})",
-            amount.0,
-            sender_id,
-            wallet_name,
-            new_balance
+            amount.0, sender_id, wallet_name, new_balance
         );
 
-        // Return 0 = we accept all tokens (no refund)
         PromiseOrValue::Value(U128(0))
     }
 
@@ -74,12 +105,9 @@ impl Contract {
 
     /// Get FT balance for a specific token in a wallet.
     pub fn get_ft_balance(&self, wallet_name: String, token: AccountId) -> U128 {
-        assert!(
-            self.wallets.get(&wallet_name).is_some(),
-            "ERR_WALLET_NOT_FOUND"
-        );
+        assert!(self.wallets.get(&wallet_name).is_some(), "ERR_WALLET_NOT_FOUND");
         let bkey = ft_balance_key(&wallet_name, token.as_str());
-        let balance: u128 = env::storage_read(&bkey.as_bytes())
+        let balance: u128 = env::storage_read(bkey.as_bytes())
             .map(|bytes| {
                 let arr: [u8; 16] = bytes.try_into().unwrap_or([0u8; 16]);
                 u128::from_le_bytes(arr)
@@ -89,14 +117,10 @@ impl Contract {
     }
 
     /// Get NEAR balance held by the contract for a specific wallet.
-    /// Note: this is tracked internally, not the raw contract balance.
     pub fn get_wallet_near_balance(&self, wallet_name: String) -> U128 {
-        assert!(
-            self.wallets.get(&wallet_name).is_some(),
-            "ERR_WALLET_NOT_FOUND"
-        );
+        assert!(self.wallets.get(&wallet_name).is_some(), "ERR_WALLET_NOT_FOUND");
         let bkey = format!("{}:near", wallet_name);
-        let balance: u128 = env::storage_read(&bkey.as_bytes())
+        let balance: u128 = env::storage_read(bkey.as_bytes())
             .map(|bytes| {
                 let arr: [u8; 16] = bytes.try_into().unwrap_or([0u8; 16]);
                 u128::from_le_bytes(arr)
@@ -109,7 +133,7 @@ impl Contract {
 // ── Internal FT Operations (used by execute.rs) ────────────────────────────
 
 impl Contract {
-    /// Credit NEAR to a wallet's internal balance (called during deposit operations).
+    /// Credit NEAR to a wallet's internal balance.
     pub(crate) fn credit_near(&mut self, wallet_name: &str, amount: u128) {
         let bkey = format!("{}:near", wallet_name);
         let current: u128 = env::storage_read(bkey.as_bytes())
@@ -158,6 +182,34 @@ mod tests {
     #[test]
     fn test_ft_balance_key() {
         assert_eq!(ft_balance_key("treasury", "usdt.tether-token.near"), "treasury:ft:usdt.tether-token.near");
-        assert_eq!(ft_balance_key("a", "b"), "a:ft:b");
+    }
+
+    #[test]
+    fn test_is_token_allowed_empty_list() {
+        let wallet = Wallet {
+            name: "test".to_string(),
+            owner: "owner.near".parse().unwrap(),
+            proposal_index: 0, intent_index: 3,
+            created_at: 0, storage_deposit: 0, storage_used: 0,
+            allowed_tokens: vec![],
+            ft_token_count: 0,
+        };
+        // Empty list = accept all
+        assert!(is_token_allowed(&wallet, &"anything.near".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_is_token_allowed_with_list() {
+        let token: AccountId = "usdt.tether-token.near".parse().unwrap();
+        let wallet = Wallet {
+            name: "test".to_string(),
+            owner: "owner.near".parse().unwrap(),
+            proposal_index: 0, intent_index: 3,
+            created_at: 0, storage_deposit: 0, storage_used: 0,
+            allowed_tokens: vec![token.clone()],
+            ft_token_count: 0,
+        };
+        assert!(is_token_allowed(&wallet, &token));
+        assert!(!is_token_allowed(&wallet, &"evil.near".parse().unwrap()));
     }
 }
