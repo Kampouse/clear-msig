@@ -863,6 +863,8 @@ impl Contract {
 
 #[cfg(test)]
 mod verification;
+#[cfg(test)]
+mod integration_tests;
 
 #[cfg(test)]
 mod tests {
