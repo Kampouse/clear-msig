@@ -1,0 +1,17 @@
+{
+  "name": "sandbox-tests",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@noble/ed25519": "^3.0.1",
+    "@noble/hashes": "^2.0.1",
+    "near-workspaces": "^5.0.0"
+  }
+}
