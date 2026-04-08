@@ -1,0 +1,20 @@
+[package]
+name = "clear-msig-sandbox-tests"
+version = "0.1.0"
+edition = "2021"
+
+[workspace] # standalone, not part of parent workspace
+
+[[test]]
+name = "sandbox"
+path = "tests/sandbox.rs"
+
+[dev-dependencies]
+near-sandbox = "0.3"
+near-api = "0.8"
+tokio = { version = "1", features = ["full"] }
+ed25519-dalek = { version = "2", features = ["default"] }
+bs58 = "0.5"
+serde_json = "1.0"
+serde = { version = "1", features = ["derive"] }
+hex = "0.4"
