@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-vstd = { git = "https://github.com/verus-lang/verus", branch = "main" }
-builtin = { git = "https://github.com/verus-lang/verus", branch = "main" }
-builtin_macros = { git = "https://github.com/verus-lang/verus", branch = "main" }
+vstd = { path = "/Users/asil/.openclaw/workspace/verus-bin/verus-arm64-macos/vstd" }
+builtin = { path = "/Users/asil/.openclaw/workspace/verus-bin/verus-arm64-macos/builtin" }
+builtin_macros = { path = "/Users/asil/.openclaw/workspace/verus-bin/verus-arm64-macos/builtin_macros" }
 
 [[bin]]
 name = "verify"
