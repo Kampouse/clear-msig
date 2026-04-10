@@ -61,6 +61,36 @@ pub fn verify_signature(public_key: &str, signature_hex: &str, message: &str) {
     assert!(valid, "Invalid signature: the message was not signed by this key");
 }
 
+/// Verify a BIP-340 schnorr signature (used by Nostr).
+/// `pubkey_hex` is the 32-byte x-only public key (npub, hex-encoded).
+/// `signature_hex` is the 64-byte schnorr signature (hex-encoded).
+/// `message` is the clear-sign text that was signed.
+pub fn verify_schnorr_signature(pubkey_hex: &str, signature_hex: &str, message: &str) {
+    use k256::schnorr::VerifyingKey;
+    use k256::sha2::{Sha256, Digest};
+
+    let pk_bytes = hex_decode(pubkey_hex);
+    assert_eq!(pk_bytes.len(), 32, "Invalid schnorr public key length (expected 32 bytes)");
+
+    let sig_bytes = hex_decode(signature_hex);
+    assert_eq!(sig_bytes.len(), 64, "Invalid schnorr signature length (expected 64 bytes)");
+
+    // Reconstruct VerifyingKey from x-only public key bytes
+    let verifying_key = VerifyingKey::from_bytes(&pk_bytes)
+        .unwrap_or_else(|_| panic!("Invalid schnorr public key"));
+
+    // Hash the message with SHA256 (same as Nostr does for event content signing)
+    let msg_hash = Sha256::digest(message.as_bytes());
+
+    // Parse schnorr signature
+    let sig = k256::schnorr::Signature::try_from(&sig_bytes[..])
+        .unwrap_or_else(|_| panic!("Invalid schnorr signature bytes"));
+
+    // Verify using BIP-340 schnorr (Nostr-compatible)
+    verifying_key.verify_raw(&msg_hash, &sig)
+        .unwrap_or_else(|_| env::panic_str("Invalid schnorr signature: verification failed"));
+}
+
 pub fn hex_decode(s: &str) -> Vec<u8> {
     (0..s.len())
         .step_by(2)
@@ -88,6 +118,7 @@ mod tests {
             template: "transfer {amount} NEAR to {recipient}".to_string(),
             proposers: vec![],
             approvers: vec![],
+            nostr_approvers: vec![],
             approval_threshold: 2,
             cancellation_threshold: 2,
             timelock_seconds: 0,
