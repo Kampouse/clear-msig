@@ -30,6 +30,12 @@ pub fn build_message(
             format!("update intent {}", idx)
         }
         IntentType::Custom => intent.render_template(params),
+        IntentType::Transfer => {
+            let amount = params.get("amount").and_then(|v| v.as_str()).unwrap_or("?");
+            let recipient = params.get("recipient").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("transfer {} to {}", amount, recipient)
+        }
+        IntentType::Deposit => "deposit NEAR to wallet".to_string(),
     };
 
     // Convert nanoseconds to ISO-ish timestamp

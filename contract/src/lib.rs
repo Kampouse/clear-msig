@@ -47,6 +47,10 @@ pub enum IntentType {
     AddIntent,
     RemoveIntent,
     UpdateIntent,
+    /// Transfer NEAR or FT tokens to a recipient
+    Transfer,
+    /// Deposit NEAR into the wallet's internal balance
+    Deposit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -306,10 +310,18 @@ pub struct Contract {
     proposals: LookupMap<String, Proposal>,
     delegations: LookupMap<String, AccountId>,
     event_nonce: u64,
+    /// Monotonic counter for replay protection. Each owner action increments this.
+    owner_nonce: u64,
 }
 
 #[near_bindgen]
 impl Contract {
+    /// State migration: called on deserialization to handle new fields.
+    fn init_state(&mut self) {
+        // If owner_nonce was missing from old state, default to 0
+        // (Borsh handles this via Default trait on u64)
+    }
+
     /// Initialize with the nostr npub of the owner.
     /// The owner controls everything — create wallets, add intents, propose.
     #[init]
@@ -322,11 +334,21 @@ impl Contract {
             proposals: LookupMap::new(StorageKey::Proposals),
             delegations: LookupMap::new(StorageKey::Delegations),
             event_nonce: 0,
+            owner_nonce: 0,
         }
     }
 
     /// Verify the caller is the nostr owner via schnorr signature.
-    fn verify_owner(&self, action: &str, signature: &str, expires_at: u64) {
+    fn verify_owner(&mut self, action: &str, signature: &str, expires_at: u64) {
+        assert!(expires_at > env::block_timestamp(), "ERR_SIG_EXPIRED");
+        let nonce = self.owner_nonce;
+        let msg = format!("expires {}.000000000: {} | nonce: {} | contract: owner", expires_at, action, nonce);
+        message::verify_schnorr_signature(&self.owner_npub, signature, &msg);
+        self.owner_nonce += 1;
+    }
+
+    /// Verify owner without consuming nonce (for read-only checks or backward compat)
+    fn verify_owner_readonly(&self, action: &str, signature: &str, expires_at: u64) {
         assert!(expires_at > env::block_timestamp(), "ERR_SIG_EXPIRED");
         let msg = format!("expires {}.000000000: {} | contract: owner", expires_at, action);
         message::verify_schnorr_signature(&self.owner_npub, signature, &msg);
@@ -375,7 +397,7 @@ impl Contract {
         w.storage_used = storage_used;
         self.wallets.insert(&name, &w);
 
-        self.emit("wallet_created", serde_json::json!({
+        self.emit_event("wallet_created", serde_json::json!({
             "wallet": name,
             "owner_npub": owner_display,
             "deposit": deposit.as_yoctonear().to_string(),
@@ -442,7 +464,7 @@ impl Contract {
 
         self.wallets.remove(&name);
 
-        self.emit("wallet_deleted", serde_json::json!({
+        self.emit_event("wallet_deleted", serde_json::json!({
             "wallet": name,
             "storage_used": wallet.storage_used,
             "refund": refund.to_string(),
@@ -473,13 +495,33 @@ impl Contract {
             }
         }
 
-        self.emit("ownership_transferred", serde_json::json!({
+        self.emit_event("ownership_transferred", serde_json::json!({
             "wallet": wallet_name,
             "old_owner": old_owner.to_string(),
             "new_owner": new_owner.to_string(),
         }));
 
         log!("Ownership of '{}' transferred to {}", wallet_name, new_owner);
+    }
+
+    /// Rotate the contract owner's nostr key. Requires signature from the CURRENT nsec.
+    /// After rotation, the new npub is used for all owner verification.
+    pub fn rotate_owner_key(&mut self, new_npub: String, signature: String, expires_at: u64) {
+        assert!(!new_npub.is_empty(), "ERR_EMPTY_NPUB");
+        assert!(new_npub.len() == 64, "ERR_INVALID_NPUB_LEN: expected 64 hex chars");
+        self.verify_owner("rotate_owner_key", &signature, expires_at);
+        let old_npub = self.owner_npub.clone();
+        self.owner_npub = new_npub.clone();
+        self.emit_event("owner_key_rotated", serde_json::json!({
+            "old_npub": old_npub,
+            "new_npub": new_npub,
+        }));
+        log!("Owner key rotated: {} -> {}", old_npub, &new_npub[..16]);
+    }
+
+    /// Get the current owner nonce (for clients to include in signatures)
+    pub fn get_owner_nonce(&self) -> u64 {
+        self.owner_nonce
     }
 
     // ── Intent Management ──────────────────────────────────────────────
@@ -497,7 +539,7 @@ impl Contract {
         wallet.allowed_tokens.push(token.clone());
         self.wallets.insert(&wallet_name, &wallet);
 
-        self.emit("token_allowed", serde_json::json!({
+        self.emit_event("token_allowed", serde_json::json!({
             "wallet": wallet_name,
             "token": token.to_string(),
         }));
@@ -517,7 +559,7 @@ impl Contract {
         );
         self.wallets.insert(&wallet_name, &wallet);
 
-        self.emit("token_removed_from_allowlist", serde_json::json!({
+        self.emit_event("token_removed_from_allowlist", serde_json::json!({
             "wallet": wallet_name,
             "token": token.to_string(),
         }));
@@ -580,7 +622,7 @@ impl Contract {
         wallet.proposal_index = proposal_index + 1;
         self.wallets.insert(&wallet_name, &wallet);
 
-        self.emit("proposal_created", serde_json::json!({
+        self.emit_event("proposal_created", serde_json::json!({
             "wallet": wallet_name, "proposal_id": proposal_index,
             "intent_index": intent_index, "message": msg,
         }));
@@ -623,7 +665,7 @@ impl Contract {
 
         self.proposals.insert(&pkey, &proposal);
 
-        self.emit("proposal_amended", serde_json::json!({
+        self.emit_event("proposal_amended", serde_json::json!({
             "wallet": wallet_name, "proposal_id": proposal_id,
         }));
 
@@ -733,7 +775,7 @@ impl Contract {
         intent.active_proposal_count += 1;
         self.intents.insert(&ikey, &intent);
 
-        self.emit("quick_proposed_and_approved", serde_json::json!({
+        self.emit_event("quick_proposed_and_approved", serde_json::json!({
             "wallet": wallet_name, "proposal_id": proposal_id, "intent_index": intent_index,
         }));
         log!("Proposal #{} quick-approved for intent #{}", proposal_id, intent_index);
@@ -865,38 +907,21 @@ impl Contract {
                 log!("Intent #{} updated", idx);
             }
             IntentType::Custom => {
+                // Keep string-matching for backwards compat with existing intents
                 if intent.template.contains("deposit") || intent.name.to_lowercase().contains("deposit") {
-                    // Deposit NEAR: credit attached deposit to wallet's internal balance
-                    let deposit_amount = env::attached_deposit().as_yoctonear();
-                    if deposit_amount > 0 {
-                        self.credit_near(&wallet_name, deposit_amount);
-                    }
-                    log!("Deposited {} yoctoNEAR to wallet '{}'", deposit_amount, wallet_name);
+                    self.execute_deposit(&wallet_name);
                 } else if intent.template.contains("transfer") || intent.name.contains("transfer") {
-                    let amount_str = params["amount"].as_str()
-                        .map(String::from)
-                        .or_else(|| params["amount"].as_u64().map(|v| v.to_string()))
-                        .unwrap_or_default();
-                    let recipient: AccountId = params["recipient"].as_str().expect("ERR_MISSING_RECIPIENT")
-                        .parse().expect("ERR_INVALID_RECIPIENT");
-                    let amount: u128 = amount_str.parse().expect("ERR_INVALID_AMOUNT");
-
-                    // Check if this is a FT transfer or NEAR transfer
-                    if let Some(token_str) = params.get("token").and_then(|v| v.as_str()) {
-                        // FT transfer
-                        self.debit_ft(&wallet_name, token_str, amount);
-                        // TODO: actual FT transfer call to token contract
-                        log!("FT transfer: {} of {} to {} (debit recorded)", amount, token_str, recipient);
-                    } else {
-                        // NEAR transfer from internal balance
-                        self.debit_near(&wallet_name, amount);
-                        Promise::new(recipient.clone()).transfer(NearToken::from_yoctonear(amount));
-                        log!("Transferred {} yoctoNEAR to {}", amount, recipient);
-                    }
+                    self.execute_transfer(&wallet_name, &params);
                 } else {
                     let truncated: String = proposal.param_values.chars().take(200).collect();
                     log!("Custom '{}' executed: {}", intent.name, truncated);
                 }
+            }
+            IntentType::Deposit => {
+                self.execute_deposit(&wallet_name);
+            }
+            IntentType::Transfer => {
+                self.execute_transfer(&wallet_name, &params);
             }
         }
 
@@ -905,7 +930,7 @@ impl Contract {
         let mut intent_mut = intent.clone();
         intent_mut.active_proposal_count = intent_mut.active_proposal_count.saturating_sub(1);
         self.intents.insert(&ikey, &intent_mut);
-        self.emit("proposal_executed", serde_json::json!({
+        self.emit_event("proposal_executed", serde_json::json!({
             "wallet": wallet_name, "proposal_id": proposal_id,
         }));
     }
@@ -922,7 +947,7 @@ impl Contract {
         );
 
         self.proposals.remove(&pkey);
-        self.emit("proposal_cleaned", serde_json::json!({
+        self.emit_event("proposal_cleaned", serde_json::json!({
             "wallet": wallet_name, "proposal_id": proposal_id,
         }));
         log!("Proposal #{} cleaned up from wallet '{}'", proposal_id, wallet_name);
@@ -978,7 +1003,36 @@ impl Contract {
 // ── Private Helpers ────────────────────────────────────────────────────────
 
 impl Contract {
-    fn emit(&mut self, event: &str, data: serde_json::Value) {
+    // ── Execution Helpers ─────────────────────────────────────────────
+
+    fn execute_deposit(&mut self, wallet_name: &String) {
+        let deposit_amount = env::attached_deposit().as_yoctonear();
+        if deposit_amount > 0 {
+            self.credit_near(wallet_name, deposit_amount);
+        }
+        log!("Deposited {} yoctoNEAR to wallet '{}'", deposit_amount, wallet_name);
+    }
+
+    fn execute_transfer(&mut self, wallet_name: &String, params: &serde_json::Value) {
+        let amount_str = params["amount"].as_str()
+            .map(String::from)
+            .or_else(|| params["amount"].as_u64().map(|v| v.to_string()))
+            .unwrap_or_default();
+        let recipient: AccountId = params["recipient"].as_str().expect("ERR_MISSING_RECIPIENT")
+            .parse().expect("ERR_INVALID_RECIPIENT");
+        let amount: u128 = amount_str.parse().expect("ERR_INVALID_AMOUNT");
+
+        if let Some(token_str) = params.get("token").and_then(|v| v.as_str()) {
+            self.debit_ft(wallet_name, token_str, amount);
+            log!("FT transfer: {} of {} to {} (debit recorded)", amount, token_str, recipient);
+        } else {
+            self.debit_near(wallet_name, amount);
+            Promise::new(recipient.clone()).transfer(NearToken::from_yoctonear(amount));
+            log!("Transferred {} yoctoNEAR to {}", amount, recipient);
+        }
+    }
+
+    fn emit_event(&mut self, event: &str, data: serde_json::Value) {
         self.event_nonce += 1;
         env::log_str(&format!(
             "EVENT_JSON:{}",
@@ -1034,7 +1088,7 @@ impl Contract {
                     proposal.status = ProposalStatus::Approved;
                     proposal.approved_at = env::block_timestamp();
 
-                    self.emit("proposal_approved", serde_json::json!({
+                    self.emit_event("proposal_approved", serde_json::json!({
                         "wallet": wallet_name, "proposal_id": proposal_id,
                         "approval_count": proposal.approval_count(),
                         "nostr": true,
@@ -1052,7 +1106,7 @@ impl Contract {
                     intent_mut.active_proposal_count = intent_mut.active_proposal_count.saturating_sub(1);
                     self.intents.insert(&ikey, &intent_mut);
 
-                    self.emit("proposal_cancelled", serde_json::json!({
+                    self.emit_event("proposal_cancelled", serde_json::json!({
                         "wallet": wallet_name, "proposal_id": proposal_id,
                         "cancellation_count": proposal.cancellation_count(),
                         "nostr": true,

@@ -84,7 +84,7 @@ impl Contract {
         // Update wallet (storage deposit may have changed)
         self.wallets.insert(&wallet_name, &wallet);
 
-        self.emit("ft_received", serde_json::json!({
+        self.emit_event("ft_received", serde_json::json!({
             "wallet": wallet_name,
             "token": token_account.to_string(),
             "amount": amount.0.to_string(),
