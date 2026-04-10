@@ -3,7 +3,7 @@ use near_sdk::collections::LookupMap;
 use near_sdk::json_types::U128;
 use near_sdk::{
     env, log, near, near_bindgen, AccountId, BorshStorageKey, NearToken,
-    PanicOnDefault, Promise, PromiseOrValue,
+    PanicOnDefault, Promise, PromiseOrValue, PromiseResult,
 };
 
 mod ft;
@@ -1042,7 +1042,7 @@ impl Contract {
         }
     }
 
-    fn execute_call(&self, wallet_name: &String, params: &serde_json::Value) {
+    fn execute_call(&mut self, wallet_name: &String, params: &serde_json::Value) {
         let receiver_id: AccountId = params["receiver_id"]
             .as_str().expect("ERR_MISSING_RECEIVER_ID")
             .parse().expect("ERR_INVALID_RECEIVER_ID");
@@ -1061,13 +1061,78 @@ impl Contract {
             .unwrap_or(DEFAULT_EXECUTION_GAS_TGAS)
             .min(MAX_EXECUTION_GAS_TGAS);
 
-        Promise::new(receiver_id.clone()).function_call(
+        // Debit wallet's internal balance for the deposit
+        if deposit > 0 {
+            self.debit_near(wallet_name, deposit);
+        }
+
+        // Execute cross-contract call with callback to handle result
+        let prepaid_gas = near_sdk::Gas::from_tgas(gas_tgas);
+        let promise = Promise::new(receiver_id.clone()).function_call(
             method_name.clone(),
             args,
             NearToken::from_yoctonear(deposit),
-            near_sdk::Gas::from_tgas(gas_tgas),
+            prepaid_gas,
         );
+
+        // Callback to self to handle result
+        let callback_gas = near_sdk::Gas::from_tgas(5);
+        let current_account = env::current_account_id();
+        promise.then(Promise::new(current_account).function_call(
+            "on_call_result".to_string(),
+            serde_json::to_vec(&serde_json::json!({
+                "wallet_name": wallet_name,
+                "receiver_id": receiver_id.to_string(),
+                "method_name": method_name,
+                "deposit": deposit.to_string(),
+            })).unwrap(),
+            NearToken::from_yoctonear(0),
+            callback_gas,
+        ));
+
         log!("Called {}.{} with {} yoctoNEAR deposit, {} Tgas", receiver_id, method_name, deposit, gas_tgas);
+    }
+
+    /// Callback after cross-contract call completes.
+    /// If the call failed, refund the deposit back to the wallet.
+    /// Only callable by the contract itself (callback).
+    pub fn on_call_result(
+        &mut self,
+        wallet_name: String,
+        receiver_id: AccountId,
+        method_name: String,
+        deposit: u128,
+    ) {
+        // Only allow self-calls (callback from our own promise)
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "ERR_CALLBACK_ONLY"
+        );
+        // Check if the promise succeeded
+        let result = env::promise_result(0u64);
+        match result {
+            PromiseResult::Successful(data) => {
+                let data_str = if data.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    format!("{} bytes", data.len())
+                };
+                log!("Call {}.{} succeeded: {}", receiver_id, method_name, data_str);
+            }
+            PromiseResult::Failed => {
+                // Refund the deposit on failure
+                if deposit > 0 {
+                    self.credit_near(&wallet_name, deposit);
+                    log!("Call {}.{} FAILED — refunded {} yoctoNEAR to wallet '{}'", receiver_id, method_name, deposit, wallet_name);
+                } else {
+                    log!("Call {}.{} FAILED (no deposit to refund)", receiver_id, method_name);
+                }
+                self.emit_event("call_failed", serde_json::json!({
+                    "wallet": wallet_name, "receiver": receiver_id, "method": method_name, "refund": deposit,
+                }));
+            }
+        }
     }
 
     fn emit_event(&mut self, event: &str, data: serde_json::Value) {
