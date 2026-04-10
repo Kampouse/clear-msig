@@ -665,6 +665,8 @@ impl Contract {
     // ── Execution ────────────────────────────────────────────────────
 
     /// Execute an approved proposal. Requires owner nostr signature.
+    /// Payable: allows attached deposit for "deposit NEAR" intent executions.
+    #[payable]
     pub fn execute(&mut self, wallet_name: String, proposal_id: u64, signature: String, expires_at: u64) {
         self.verify_owner(&format!("execute:{}:{}", wallet_name, proposal_id), &signature, expires_at);
         let pkey = proposal_key(&wallet_name, proposal_id);
