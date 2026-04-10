@@ -662,6 +662,86 @@ impl Contract {
     }
 
 
+    // ── Quick Execute (Solo User) ────────────────────────────────────
+
+    /// One-call execution for solo users. Proposes, auto-approves, and
+    /// executes in a single transaction. Only works when:
+    /// - The caller is the owner (verified via nostr signature)
+    /// - The intent has approval_threshold == 1
+    /// - The owner's npub is in intent.nostr_approvers
+    ///
+    /// This lets a Nostr user do everything with a single signed message.
+    #[payable]
+    pub fn quick_execute(
+        &mut self,
+        wallet_name: String,
+        intent_index: u32,
+        param_values: String,
+        expires_at: u64,
+        signature: String,
+    ) {
+        // Verify owner signature for this action
+        let action = format!("quick:{}:{}:{}", wallet_name, intent_index, &param_values.chars().take(64).collect::<String>());
+        self.verify_owner(&action, &signature, expires_at);
+
+        let ikey = intent_key(&wallet_name, intent_index);
+        let intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
+        assert!(intent.active, "ERR_INTENT_INACTIVE");
+        assert!(intent.approval_threshold == 1, "ERR_NOT_SOLO: quick_execute only works with approval_threshold=1");
+
+        // Check owner is in nostr_approvers
+        let owner_is_approver = intent.nostr_approvers.iter().any(|p| p == &self.owner_npub);
+        assert!(owner_is_approver, "ERR_OWNER_NOT_APPROVER: owner must be in nostr_approvers");
+
+        // Validate params
+        let params: serde_json::Value = serde_json::from_str(&param_values).expect("ERR_INVALID_JSON");
+        self.validate_params(&intent, &params);
+
+        // Create proposal
+        let wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        let proposal_id = wallet.proposal_index;
+        let msg = message::build_message(&wallet_name, proposal_id, expires_at, "quick", &intent, &params);
+
+        let proposal = Proposal {
+            id: proposal_id,
+            wallet_name: wallet_name.clone(),
+            intent_index,
+            proposer: env::predecessor_account_id(),
+            status: ProposalStatus::Approved, // Auto-approved
+            proposed_at: env::block_timestamp(),
+            approved_at: env::block_timestamp(),
+            expires_at,
+            approval_bitmap: 0,
+            cancellation_bitmap: 0,
+            nostr_approval_bitmap: 1u64 << 0, // Owner approved
+            nostr_cancellation_bitmap: 0,
+            param_values: param_values.clone(),
+            message: msg,
+            intent_params_hash: hash_params(&intent.params),
+        };
+
+        let pkey = proposal_key(&wallet_name, proposal_id);
+        self.proposals.insert(&pkey, &proposal);
+
+        // Update wallet proposal index
+        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        wallet.proposal_index += 1;
+        self.wallets.insert(&wallet_name, &wallet);
+
+        // Update intent active_proposal_count
+        let mut intent = intent;
+        intent.active_proposal_count += 1;
+        self.intents.insert(&ikey, &intent);
+
+        self.emit("quick_proposed_and_approved", serde_json::json!({
+            "wallet": wallet_name, "proposal_id": proposal_id, "intent_index": intent_index,
+        }));
+        log!("Proposal #{} quick-approved for intent #{}", proposal_id, intent_index);
+
+        // Now execute it (inline the execution logic)
+        self.execute_proposal(&wallet_name, proposal_id);
+    }
+
     // ── Execution ────────────────────────────────────────────────────
 
     /// Execute an approved proposal. Requires owner nostr signature.
@@ -669,11 +749,16 @@ impl Contract {
     #[payable]
     pub fn execute(&mut self, wallet_name: String, proposal_id: u64, signature: String, expires_at: u64) {
         self.verify_owner(&format!("execute:{}:{}", wallet_name, proposal_id), &signature, expires_at);
-        let pkey = proposal_key(&wallet_name, proposal_id);
+        self.execute_proposal(&wallet_name, proposal_id);
+    }
+
+    /// Internal execution logic shared by execute() and quick_execute().
+    fn execute_proposal(&mut self, wallet_name: &String, proposal_id: u64) {
+        let pkey = proposal_key(wallet_name, proposal_id);
         let mut proposal = self.proposals.get(&pkey).expect("ERR_PROPOSAL_NOT_FOUND");
         assert!(proposal.status == ProposalStatus::Approved, "ERR_NOT_APPROVED");
 
-        let ikey = intent_key(&wallet_name, proposal.intent_index);
+        let ikey = intent_key(wallet_name, proposal.intent_index);
         let intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
         
         // Check timelock
