@@ -36,6 +36,12 @@ pub fn build_message(
             format!("transfer {} to {}", amount, recipient)
         }
         IntentType::Deposit => "deposit NEAR to wallet".to_string(),
+        IntentType::Call => {
+            let receiver = params.get("receiver_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let method = params.get("method_name").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("call {}.{}({})", receiver, method, 
+                params.get("args").and_then(|v| v.as_str()).unwrap_or("").chars().take(32).collect::<String>())
+        }
     };
 
     // Convert nanoseconds to ISO-ish timestamp

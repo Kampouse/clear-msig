@@ -9,6 +9,8 @@ use near_sdk::{
 mod ft;
 mod message;
 
+use base64::Engine;
+
 use message::hex_encode;
 
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -51,6 +53,8 @@ pub enum IntentType {
     Transfer,
     /// Deposit NEAR into the wallet's internal balance
     Deposit,
+    /// Arbitrary cross-contract call
+    Call,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -825,6 +829,9 @@ impl Contract {
                 let new_intent: Intent = if let Some(def) = definition {
                     near_sdk::serde_json::from_str(def)
                         .expect("ERR_INVALID_INTENT_DEFINITION")
+                } else if let Some(def_obj) = params.get("definition") {
+                    near_sdk::serde_json::from_value(def_obj.clone())
+                        .expect("ERR_INVALID_INTENT_DEFINITION")
                 } else {
                     // Build intent from top-level params with defaults
                     let proposers: Vec<AccountId> = params.get("proposers")
@@ -922,6 +929,9 @@ impl Contract {
             }
             IntentType::Transfer => {
                 self.execute_transfer(&wallet_name, &params);
+            }
+            IntentType::Call => {
+                self.execute_call(&wallet_name, &params);
             }
         }
 
@@ -1030,6 +1040,34 @@ impl Contract {
             Promise::new(recipient.clone()).transfer(NearToken::from_yoctonear(amount));
             log!("Transferred {} yoctoNEAR to {}", amount, recipient);
         }
+    }
+
+    fn execute_call(&self, wallet_name: &String, params: &serde_json::Value) {
+        let receiver_id: AccountId = params["receiver_id"]
+            .as_str().expect("ERR_MISSING_RECEIVER_ID")
+            .parse().expect("ERR_INVALID_RECEIVER_ID");
+        let method_name = params["method_name"]
+            .as_str().expect("ERR_MISSING_METHOD_NAME").to_string();
+        let args_b64 = params.get("args")
+            .and_then(|v| v.as_str()).unwrap_or("");
+        let args = base64::engine::general_purpose::STANDARD
+            .decode(args_b64).unwrap_or_default();
+        let deposit: u128 = params.get("deposit")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let gas_tgas: u64 = params.get("gas")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(DEFAULT_EXECUTION_GAS_TGAS)
+            .min(MAX_EXECUTION_GAS_TGAS);
+
+        Promise::new(receiver_id.clone()).function_call(
+            method_name.clone(),
+            args,
+            NearToken::from_yoctonear(deposit),
+            near_sdk::Gas::from_tgas(gas_tgas),
+        );
+        log!("Called {}.{} with {} yoctoNEAR deposit, {} Tgas", receiver_id, method_name, deposit, gas_tgas);
     }
 
     fn emit_event(&mut self, event: &str, data: serde_json::Value) {
@@ -1298,3 +1336,4 @@ mod tests {
         assert_eq!(parsed["msg"], "");
     }
 }
+
