@@ -228,6 +228,48 @@ impl Proposal {
     }
 }
 
+// ── Wallet Migration ──────────────────────────────────────────────────────
+
+/// Old wallet format (V1) — no spending limits or relayer config.
+/// Used only for Borsh deserialization of legacy state.
+#[derive(BorshSerialize, BorshDeserialize)]
+#[borsh(crate = "near_sdk::borsh")]
+struct WalletV1 {
+    name: String,
+    owner: AccountId,
+    proposal_index: u64,
+    intent_index: u32,
+    created_at: u64,
+    storage_deposit: u128,
+    storage_used: u64,
+    allowed_tokens: Vec<AccountId>,
+    ft_token_count: u32,
+}
+
+impl From<WalletV1> for Wallet {
+    fn from(v1: WalletV1) -> Self {
+        Wallet {
+            name: v1.name,
+            owner: v1.owner,
+            proposal_index: v1.proposal_index,
+            intent_index: v1.intent_index,
+            created_at: v1.created_at,
+            storage_deposit: v1.storage_deposit,
+            storage_used: v1.storage_used,
+            allowed_tokens: v1.allowed_tokens,
+            ft_token_count: v1.ft_token_count,
+            // New fields get safe defaults
+            call_allowed_receivers: Vec::new(),
+            call_max_deposit: 0,
+            daily_spend_limit: 0,
+            daily_spend_reset_at: v1.created_at,
+            daily_spend_used: 0,
+            relayer_fee: 0,
+            allowed_relayers: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 #[near(serializers = [borsh, json])]
 pub struct Wallet {
@@ -371,8 +413,47 @@ pub struct Contract {
 impl Contract {
     /// State migration: called on deserialization to handle new fields.
     fn init_state(&mut self) {
-        // If owner_nonce was missing from old state, default to 0
-        // (Borsh handles this via Default trait on u64)
+        // Wallet migration is handled lazily via wallet_get/wallet_insert helpers.
+    }
+
+    // ── Wallet Storage Helpers (with migration) ──────────────────────
+
+    /// Get a wallet, automatically migrating from old format if needed.
+    /// Writes back the migrated version so future reads are V2-native.
+    fn wallet_get(&mut self, name: &str) -> Option<Wallet> {
+        let key = name.to_string();
+        // Try V2 (current) deserialization first
+        if let Some(wallet) = self.wallets.get(&key) {
+            return Some(wallet);
+        }
+        // V2 failed — try V1 migration via raw storage
+        let storage_key = {
+            let mut k = Vec::new();
+            near_sdk::borsh::BorshSerialize::serialize(&StorageKey::Wallets, &mut k).unwrap();
+            near_sdk::borsh::BorshSerialize::serialize(&key, &mut k).unwrap();
+            k
+        };
+        if let Some(bytes) = env::storage_read(&storage_key) {
+            if let Ok(v1) = WalletV1::try_from_slice(&bytes) {
+                let wallet: Wallet = v1.into();
+                self.wallets.insert(&key, &wallet);
+                log!("Migrated wallet '{}' from V1 to V2", name);
+                return Some(wallet);
+            }
+        }
+        None
+    }
+
+    fn wallet_get_readonly(&self, name: &str) -> Option<Wallet> {
+        self.wallets.get(&name.to_string())
+    }
+
+    fn wallet_insert(&mut self, name: &str, wallet: &Wallet) {
+        self.wallets.insert(&name.to_string(), wallet);
+    }
+
+    fn wallet_remove(&mut self, name: &str) -> Option<Wallet> {
+        self.wallets.remove(&name.to_string())
     }
 
     /// Initialize with the nostr npub of the owner.
@@ -420,7 +501,7 @@ impl Contract {
             deposit.as_yoctonear()
         );
 
-        assert!(self.wallets.get(&name).is_none(), "ERR_WALLET_EXISTS");
+        assert!(self.wallet_get(&name).is_none(), "ERR_WALLET_EXISTS");
         assert!(!name.is_empty(), "ERR_NAME_EMPTY");
         assert!(name.len() <= 64, "ERR_NAME_TOO_LONG");
         assert!(
@@ -448,14 +529,14 @@ impl Contract {
             relayer_fee: 0,
             allowed_relayers: Vec::new(),
         };
-        self.wallets.insert(&name, &wallet);
+        self.wallet_insert(&name, &wallet);
         self.create_meta_intents(&name, &env::predecessor_account_id());
         let storage_used = env::storage_usage() - initial_storage;
 
         // Update with actual storage usage
-        let mut w = self.wallets.get(&name).unwrap();
+        let mut w = self.wallet_get(&name).unwrap();
         w.storage_used = storage_used;
-        self.wallets.insert(&name, &w);
+        self.wallet_insert(&name, &w);
 
         self.emit_event("wallet_created", serde_json::json!({
             "wallet": name,
@@ -480,7 +561,7 @@ impl Contract {
 
     pub fn delete_wallet(&mut self, name: String, signature: String, expires_at: u64) {
         self.verify_owner(&format!("delete_wallet:{}", name), &signature, expires_at);
-        let wallet = self.wallets.get(&name).expect("ERR_WALLET_NOT_FOUND");
+        let wallet = self.wallet_get(&name).expect("ERR_WALLET_NOT_FOUND");
 
         for i in 0..wallet.intent_index {
             if let Some(intent) = self.intents.get(&intent_key(&name, i)) {
@@ -522,7 +603,7 @@ impl Contract {
             Promise::new(wallet.owner.clone()).transfer(NearToken::from_yoctonear(refund));
         }
 
-        self.wallets.remove(&name);
+        self.wallet_remove(&name);
 
         self.emit_event("wallet_deleted", serde_json::json!({
             "wallet": name,
@@ -535,12 +616,12 @@ impl Contract {
 
     pub fn transfer_ownership(&mut self, wallet_name: String, new_owner: AccountId, signature: String, expires_at: u64) {
         self.verify_owner(&format!("transfer_ownership:{}", wallet_name), &signature, expires_at);
-        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         assert_ne!(new_owner, wallet.owner, "ERR_ALREADY_OWNER");
 
         let old_owner = wallet.owner.clone();
         wallet.owner = new_owner.clone();
-        self.wallets.insert(&wallet_name, &wallet);
+        self.wallet_insert(&wallet_name, &wallet);
 
         for i in 0..3u32 {
             let ikey = intent_key(&wallet_name, i);
@@ -591,13 +672,13 @@ impl Contract {
     /// Once you add the first token, only listed tokens are accepted.
     pub fn add_allowed_token(&mut self, wallet_name: String, token: AccountId, signature: String, expires_at: u64) {
         self.verify_owner(&format!("add_allowed_token:{}", wallet_name), &signature, expires_at);
-        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         assert!(
             !wallet.allowed_tokens.contains(&token),
             "ERR_TOKEN_ALREADY_ALLOWED"
         );
         wallet.allowed_tokens.push(token.clone());
-        self.wallets.insert(&wallet_name, &wallet);
+        self.wallet_insert(&wallet_name, &wallet);
 
         self.emit_event("token_allowed", serde_json::json!({
             "wallet": wallet_name,
@@ -610,14 +691,14 @@ impl Contract {
     /// Remove a token from the wallet's FT allowlist. Owner only.
     pub fn remove_allowed_token(&mut self, wallet_name: String, token: AccountId, signature: String, expires_at: u64) {
         self.verify_owner(&format!("remove_allowed_token:{}", wallet_name), &signature, expires_at);
-        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         let original_len = wallet.allowed_tokens.len();
         wallet.allowed_tokens.retain(|t| t != &token);
         assert!(
             wallet.allowed_tokens.len() < original_len,
             "ERR_TOKEN_NOT_IN_LIST"
         );
-        self.wallets.insert(&wallet_name, &wallet);
+        self.wallet_insert(&wallet_name, &wallet);
 
         self.emit_event("token_removed_from_allowlist", serde_json::json!({
             "wallet": wallet_name,
@@ -637,7 +718,7 @@ impl Contract {
         expires_at: u64,
         signature: String,
     ) {
-        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         let ikey = intent_key(&wallet_name, intent_index);
         let intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
 
@@ -680,7 +761,7 @@ impl Contract {
         self.intents.insert(&ikey, &intent_mut);
 
         wallet.proposal_index = proposal_index + 1;
-        self.wallets.insert(&wallet_name, &wallet);
+        self.wallet_insert(&wallet_name, &wallet);
 
         self.emit_event("proposal_created", serde_json::json!({
             "wallet": wallet_name, "proposal_id": proposal_index,
@@ -800,7 +881,7 @@ impl Contract {
         self.validate_params(&intent, &params);
 
         // Create proposal
-        let wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        let wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         let proposal_id = wallet.proposal_index;
         let msg = message::build_message(&wallet_name, proposal_id, expires_at, "quick", &intent, &params);
 
@@ -826,9 +907,9 @@ impl Contract {
         self.proposals.insert(&pkey, &proposal);
 
         // Update wallet proposal index
-        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.proposal_index += 1;
-        self.wallets.insert(&wallet_name, &wallet);
+        self.wallet_insert(&wallet_name, &wallet);
 
         // Update intent active_proposal_count
         let mut intent = intent;
@@ -923,11 +1004,11 @@ impl Contract {
                         active_proposal_count: 0,
                     }
                 };
-                let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+                let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
                 let new_index = wallet.intent_index;
                 self.intents.insert(&intent_key(&wallet_name, new_index), &new_intent);
                 wallet.intent_index += 1;
-                self.wallets.insert(&wallet_name, &wallet);
+                self.wallet_insert(&wallet_name, &wallet);
                 log!("Intent #{} added to wallet {}", new_index, wallet_name);
             }
             IntentType::RemoveIntent => {
@@ -1022,7 +1103,7 @@ impl Contract {
     // ── Views ──────────────────────────────────────────────────────────
 
     pub fn get_wallet(&self, name: String) -> Option<Wallet> {
-        self.wallets.get(&name)
+        self.wallet_get_readonly(&name)
     }
 
     pub fn get_intent(&self, wallet_name: String, index: u32) -> Option<Intent> {
@@ -1030,7 +1111,7 @@ impl Contract {
     }
 
     pub fn list_intents(&self, wallet_name: String) -> Vec<Intent> {
-        let Some(wallet) = self.wallets.get(&wallet_name) else { return Vec::new(); };
+        let Some(wallet) = self.wallet_get_readonly(&wallet_name) else { return Vec::new(); };
         (0..wallet.intent_index)
             .filter_map(|i| self.intents.get(&intent_key(&wallet_name, i)))
             .collect()
@@ -1041,7 +1122,7 @@ impl Contract {
     }
 
     pub fn list_proposals(&self, wallet_name: String) -> Vec<Proposal> {
-        let Some(wallet) = self.wallets.get(&wallet_name) else { return Vec::new(); };
+        let Some(wallet) = self.wallet_get_readonly(&wallet_name) else { return Vec::new(); };
         (0..wallet.proposal_index)
             .filter_map(|i| self.proposals.get(&proposal_key(&wallet_name, i)))
             .collect()
@@ -1052,7 +1133,7 @@ impl Contract {
     }
 
     pub fn get_allowed_tokens(&self, wallet_name: String) -> Vec<AccountId> {
-        self.wallets.get(&wallet_name)
+        self.wallet_get_readonly(&wallet_name)
             .map(|w| w.allowed_tokens)
             .unwrap_or_default()
     }
@@ -1077,7 +1158,7 @@ impl Contract {
 
     /// Get comprehensive wallet state: wallet, intents, balances, recent proposals
     pub fn get_wallet_state(&self, wallet_name: String) -> serde_json::Value {
-        let wallet = match self.wallets.get(&wallet_name) {
+        let wallet = match self.wallet_get_readonly(&wallet_name) {
             Some(w) => w,
             None => return serde_json::json!({"error": "ERR_WALLET_NOT_FOUND"}),
         };
@@ -1114,7 +1195,7 @@ impl Contract {
         from: u64,
         limit: u64,
     ) -> Vec<Proposal> {
-        let wallet = match self.wallets.get(&wallet_name) {
+        let wallet = match self.wallet_get_readonly(&wallet_name) {
             Some(w) => w,
             None => return Vec::new(),
         };
@@ -1127,7 +1208,7 @@ impl Contract {
 
     /// Get daily spend stats for a wallet
     pub fn get_spend_stats(&self, wallet_name: String) -> serde_json::Value {
-        let wallet = match self.wallets.get(&wallet_name) {
+        let wallet = match self.wallet_get_readonly(&wallet_name) {
             Some(w) => w,
             None => return serde_json::json!({"error": "ERR_WALLET_NOT_FOUND"}),
         };
@@ -1151,9 +1232,9 @@ impl Contract {
         expires_at: u64,
     ) {
         self.verify_owner(&format!("set_call_receivers:{}", wallet_name), &signature, expires_at);
-        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.call_allowed_receivers = receivers;
-        self.wallets.insert(&wallet_name, &wallet);
+        self.wallet_insert(&wallet_name, &wallet);
         self.emit_event("call_receivers_updated", serde_json::json!({"wallet": wallet_name}));
         log!("Call receiver allowlist updated for '{}'", wallet_name);
     }
@@ -1167,9 +1248,9 @@ impl Contract {
         expires_at: u64,
     ) {
         self.verify_owner(&format!("set_call_max_deposit:{}", wallet_name), &signature, expires_at);
-        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.call_max_deposit = max_deposit.0;
-        self.wallets.insert(&wallet_name, &wallet);
+        self.wallet_insert(&wallet_name, &wallet);
         self.emit_event("call_max_deposit_updated", serde_json::json!({"wallet": wallet_name, "max": max_deposit.0.to_string()}));
         log!("Call max deposit set to {} for '{}'", max_deposit.0, wallet_name);
     }
@@ -1183,9 +1264,9 @@ impl Contract {
         expires_at: u64,
     ) {
         self.verify_owner(&format!("set_daily_limit:{}", wallet_name), &signature, expires_at);
-        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.daily_spend_limit = limit.0;
-        self.wallets.insert(&wallet_name, &wallet);
+        self.wallet_insert(&wallet_name, &wallet);
         self.emit_event("daily_limit_updated", serde_json::json!({"wallet": wallet_name, "limit": limit.0.to_string()}));
         log!("Daily spend limit set to {} for '{}'", limit.0, wallet_name);
     }
@@ -1199,9 +1280,9 @@ impl Contract {
         expires_at: u64,
     ) {
         self.verify_owner(&format!("set_relayer_fee:{}", wallet_name), &signature, expires_at);
-        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.relayer_fee = fee.0;
-        self.wallets.insert(&wallet_name, &wallet);
+        self.wallet_insert(&wallet_name, &wallet);
         self.emit_event("relayer_fee_updated", serde_json::json!({"wallet": wallet_name, "fee": fee.0.to_string()}));
         log!("Relayer fee set to {} for '{}'", fee.0, wallet_name);
     }
@@ -1215,9 +1296,9 @@ impl Contract {
         expires_at: u64,
     ) {
         self.verify_owner(&format!("set_relayers:{}", wallet_name), &signature, expires_at);
-        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.allowed_relayers = relayers;
-        self.wallets.insert(&wallet_name, &wallet);
+        self.wallet_insert(&wallet_name, &wallet);
         self.emit_event("relayers_updated", serde_json::json!({"wallet": wallet_name}));
         log!("Relayer allowlist updated for '{}'", wallet_name);
     }
@@ -1298,7 +1379,7 @@ impl Contract {
         from_id: u64,
         to_id: u64,
     ) -> u64 {
-        let wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        let wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         let now = env::block_timestamp();
         let mut cleaned = 0u64;
 
@@ -1357,10 +1438,10 @@ impl Contract {
 
         // Enforce daily spend limit
         {
-            let mut wallet = self.wallets.get(wallet_name).expect("ERR_WALLET_NOT_FOUND");
+            let mut wallet = self.wallet_get(wallet_name).expect("ERR_WALLET_NOT_FOUND");
             wallet.enforce_spend_limit(env::block_timestamp());
             wallet.track_spend(amount);
-            self.wallets.insert(wallet_name, &wallet);
+            self.wallet_insert(wallet_name, &wallet);
         }
 
         if let Some(token_str) = params.get("token").and_then(|v| v.as_str()) {
@@ -1415,7 +1496,7 @@ impl Contract {
 
         // Enforce wallet limits
         {
-            let mut wallet = self.wallets.get(wallet_name).expect("ERR_WALLET_NOT_FOUND");
+            let mut wallet = self.wallet_get(wallet_name).expect("ERR_WALLET_NOT_FOUND");
 
             // Receiver allowlist check
             assert!(
@@ -1444,7 +1525,7 @@ impl Contract {
                 wallet.storage_deposit = wallet.storage_deposit.saturating_sub(wallet.relayer_fee);
             }
 
-            self.wallets.insert(wallet_name, &wallet);
+            self.wallet_insert(wallet_name, &wallet);
         }
 
         // Debit wallet's internal balance for the deposit

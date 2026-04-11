@@ -44,7 +44,7 @@ impl Contract {
             msg
         };
 
-        let mut wallet = self.wallets.get(&wallet_name)
+        let mut wallet = self.wallet_get(&wallet_name)
             .unwrap_or_else(|| env::panic_str(&format!("ERR_WALLET_NOT_FOUND: {}", wallet_name)));
 
         // Check token allowlist
@@ -82,7 +82,7 @@ impl Contract {
         env::storage_write(&bkey.as_bytes(), &new_balance.to_le_bytes());
 
         // Update wallet (storage deposit may have changed)
-        self.wallets.insert(&wallet_name, &wallet);
+        self.wallet_insert(&wallet_name, &wallet);
 
         self.emit_event("ft_received", serde_json::json!({
             "wallet": wallet_name,
@@ -105,7 +105,7 @@ impl Contract {
 
     /// Get FT balance for a specific token in a wallet.
     pub fn get_ft_balance(&self, wallet_name: String, token: AccountId) -> U128 {
-        assert!(self.wallets.get(&wallet_name).is_some(), "ERR_WALLET_NOT_FOUND");
+        assert!(self.wallet_get_readonly(&wallet_name).is_some(), "ERR_WALLET_NOT_FOUND");
         let bkey = ft_balance_key(&wallet_name, token.as_str());
         let balance: u128 = env::storage_read(bkey.as_bytes())
             .map(|bytes| {
@@ -118,7 +118,7 @@ impl Contract {
 
     /// Get NEAR balance held by the contract for a specific wallet.
     pub fn get_wallet_near_balance(&self, wallet_name: String) -> U128 {
-        assert!(self.wallets.get(&wallet_name).is_some(), "ERR_WALLET_NOT_FOUND");
+        assert!(self.wallet_get_readonly(&wallet_name).is_some(), "ERR_WALLET_NOT_FOUND");
         let bkey = format!("{}:near", wallet_name);
         let balance: u128 = env::storage_read(bkey.as_bytes())
             .map(|bytes| {
