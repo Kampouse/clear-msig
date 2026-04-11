@@ -173,6 +173,19 @@ impl Contract {
         let new_balance = current - amount;
         env::storage_write(bkey.as_bytes(), &new_balance.to_le_bytes());
     }
+
+    /// Credit FT to a wallet's internal balance (for refunds).
+    pub(crate) fn credit_ft(&mut self, wallet_name: &str, token: &str, amount: u128) {
+        let bkey = ft_balance_key(wallet_name, token);
+        let current: u128 = env::storage_read(bkey.as_bytes())
+            .map(|bytes| {
+                let arr: [u8; 16] = bytes.try_into().unwrap_or([0u8; 16]);
+                u128::from_le_bytes(arr)
+            })
+            .unwrap_or(0);
+        let new_balance = current + amount;
+        env::storage_write(bkey.as_bytes(), &new_balance.to_le_bytes());
+    }
 }
 
 #[cfg(test)]

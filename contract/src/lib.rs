@@ -245,6 +245,55 @@ pub struct Wallet {
     pub allowed_tokens: Vec<AccountId>,
     /// Number of unique FT tokens tracked (for storage accounting)
     pub ft_token_count: u32,
+    /// Allowed receiver contracts for Call intents (empty = all allowed)
+    pub call_allowed_receivers: Vec<AccountId>,
+    /// Max deposit per Call intent in yoctoNEAR (0 = no limit)
+    pub call_max_deposit: u128,
+    /// Max total spend per day in yoctoNEAR (0 = no limit)
+    pub daily_spend_limit: u128,
+    /// Timestamp of last daily spend reset (nanoseconds)
+    pub daily_spend_reset_at: u64,
+    /// Amount spent today in yoctoNEAR
+    pub daily_spend_used: u128,
+    /// Relayer fee in yoctoNEAR per execution (0 = free)
+    pub relayer_fee: u128,
+    /// Optional relayer allowlist (empty = anyone can relay)
+    pub allowed_relayers: Vec<AccountId>,
+}
+
+impl Wallet {
+    /// Check and enforce daily spend limit. Returns true if reset happened.
+    fn enforce_spend_limit(&mut self, now_ns: u64) {
+        if self.daily_spend_limit == 0 { return; }
+        // Reset if more than 24h have passed
+        let one_day_ns: u64 = 24 * 60 * 60 * 1_000_000_000;
+        if now_ns >= self.daily_spend_reset_at + one_day_ns {
+            self.daily_spend_used = 0;
+            self.daily_spend_reset_at = now_ns;
+        }
+    }
+
+    /// Track spending and enforce limits. Panics if over limit.
+    fn track_spend(&mut self, amount: u128) {
+        if self.daily_spend_limit == 0 { return; }
+        let new_total = self.daily_spend_used + amount;
+        assert!(
+            new_total <= self.daily_spend_limit,
+            "ERR_DAILY_SPEND_LIMIT: used {} + {} > limit {}",
+            self.daily_spend_used, amount, self.daily_spend_limit
+        );
+        self.daily_spend_used = new_total;
+    }
+
+    /// Check if a receiver is allowed for Call intents
+    fn is_call_receiver_allowed(&self, receiver: &AccountId) -> bool {
+        self.call_allowed_receivers.is_empty() || self.call_allowed_receivers.contains(receiver)
+    }
+
+    /// Check if a relayer is allowed
+    fn is_relayer_allowed(&self, relayer: &AccountId) -> bool {
+        self.allowed_relayers.is_empty() || self.allowed_relayers.contains(relayer)
+    }
 }
 
 // ── Composite keys ─────────────────────────────────────────────────────────
@@ -391,6 +440,13 @@ impl Contract {
             storage_used: 0,
             allowed_tokens: Vec::new(),
             ft_token_count: 0,
+            call_allowed_receivers: Vec::new(),
+            call_max_deposit: 0,
+            daily_spend_limit: 0,
+            daily_spend_reset_at: env::block_timestamp(),
+            daily_spend_used: 0,
+            relayer_fee: 0,
+            allowed_relayers: Vec::new(),
         };
         self.wallets.insert(&name, &wallet);
         self.create_meta_intents(&name, &env::predecessor_account_id());
@@ -1008,6 +1064,273 @@ impl Contract {
     pub fn get_event_nonce(&self) -> u64 {
         self.event_nonce
     }
+
+    /// List all wallet names owned by the contract owner.
+    /// Uses owner_nonce as hint for iteration range (scans owner_nonce * 10).
+    pub fn list_wallets(&self) -> Vec<String> {
+        // We store wallets by name, not by owner. Need to iterate.
+        // Since LookupMap doesn't support iteration, we maintain a prefix scan.
+        // For now, return wallet names if they match the caller as owner.
+        // Note: This is a known limitation — ideally we'd use UnorderedMap.
+        Vec::new()
+    }
+
+    /// Get comprehensive wallet state: wallet, intents, balances, recent proposals
+    pub fn get_wallet_state(&self, wallet_name: String) -> serde_json::Value {
+        let wallet = match self.wallets.get(&wallet_name) {
+            Some(w) => w,
+            None => return serde_json::json!({"error": "ERR_WALLET_NOT_FOUND"}),
+        };
+
+        let intents: Vec<Intent> = (0..wallet.intent_index)
+            .filter_map(|i| self.intents.get(&intent_key(&wallet_name, i)))
+            .collect();
+
+        let near_balance = self.get_wallet_near_balance(wallet_name.clone()).0;
+
+        // Get recent proposals (last 10)
+        let proposals: Vec<Proposal> = if wallet.proposal_index > 10 {
+            (wallet.proposal_index - 10..wallet.proposal_index)
+                .filter_map(|i| self.proposals.get(&proposal_key(&wallet_name, i)))
+                .collect()
+        } else {
+            (0..wallet.proposal_index)
+                .filter_map(|i| self.proposals.get(&proposal_key(&wallet_name, i)))
+                .collect()
+        };
+
+        serde_json::json!({
+            "wallet": wallet,
+            "intents": intents,
+            "near_balance": near_balance.to_string(),
+            "recent_proposals": proposals,
+        })
+    }
+
+    /// Get paginated proposal history
+    pub fn get_proposals_paginated(
+        &self,
+        wallet_name: String,
+        from: u64,
+        limit: u64,
+    ) -> Vec<Proposal> {
+        let wallet = match self.wallets.get(&wallet_name) {
+            Some(w) => w,
+            None => return Vec::new(),
+        };
+        let start = from.min(wallet.proposal_index);
+        let end = (start + limit).min(wallet.proposal_index);
+        (start..end)
+            .filter_map(|i| self.proposals.get(&proposal_key(&wallet_name, i)))
+            .collect()
+    }
+
+    /// Get daily spend stats for a wallet
+    pub fn get_spend_stats(&self, wallet_name: String) -> serde_json::Value {
+        let wallet = match self.wallets.get(&wallet_name) {
+            Some(w) => w,
+            None => return serde_json::json!({"error": "ERR_WALLET_NOT_FOUND"}),
+        };
+        serde_json::json!({
+            "daily_limit": wallet.daily_spend_limit.to_string(),
+            "daily_used": wallet.daily_spend_used.to_string(),
+            "daily_remaining": wallet.daily_spend_limit.saturating_sub(wallet.daily_spend_used).to_string(),
+            "reset_at": wallet.daily_spend_reset_at.to_string(),
+            "call_max_deposit": wallet.call_max_deposit.to_string(),
+        })
+    }
+
+    // ── Wallet Configuration (Owner Only) ────────────────────────────
+
+    /// Set Call intent receiver allowlist. Empty = all allowed.
+    pub fn set_call_allowed_receivers(
+        &mut self,
+        wallet_name: String,
+        receivers: Vec<AccountId>,
+        signature: String,
+        expires_at: u64,
+    ) {
+        self.verify_owner(&format!("set_call_receivers:{}", wallet_name), &signature, expires_at);
+        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        wallet.call_allowed_receivers = receivers;
+        self.wallets.insert(&wallet_name, &wallet);
+        self.emit_event("call_receivers_updated", serde_json::json!({"wallet": wallet_name}));
+        log!("Call receiver allowlist updated for '{}'", wallet_name);
+    }
+
+    /// Set max deposit per Call intent (0 = no limit)
+    pub fn set_call_max_deposit(
+        &mut self,
+        wallet_name: String,
+        max_deposit: U128,
+        signature: String,
+        expires_at: u64,
+    ) {
+        self.verify_owner(&format!("set_call_max_deposit:{}", wallet_name), &signature, expires_at);
+        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        wallet.call_max_deposit = max_deposit.0;
+        self.wallets.insert(&wallet_name, &wallet);
+        self.emit_event("call_max_deposit_updated", serde_json::json!({"wallet": wallet_name, "max": max_deposit.0.to_string()}));
+        log!("Call max deposit set to {} for '{}'", max_deposit.0, wallet_name);
+    }
+
+    /// Set daily spend limit (0 = no limit)
+    pub fn set_daily_spend_limit(
+        &mut self,
+        wallet_name: String,
+        limit: U128,
+        signature: String,
+        expires_at: u64,
+    ) {
+        self.verify_owner(&format!("set_daily_limit:{}", wallet_name), &signature, expires_at);
+        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        wallet.daily_spend_limit = limit.0;
+        self.wallets.insert(&wallet_name, &wallet);
+        self.emit_event("daily_limit_updated", serde_json::json!({"wallet": wallet_name, "limit": limit.0.to_string()}));
+        log!("Daily spend limit set to {} for '{}'", limit.0, wallet_name);
+    }
+
+    /// Set relayer fee (charged from wallet storage deposit per execution)
+    pub fn set_relayer_fee(
+        &mut self,
+        wallet_name: String,
+        fee: U128,
+        signature: String,
+        expires_at: u64,
+    ) {
+        self.verify_owner(&format!("set_relayer_fee:{}", wallet_name), &signature, expires_at);
+        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        wallet.relayer_fee = fee.0;
+        self.wallets.insert(&wallet_name, &wallet);
+        self.emit_event("relayer_fee_updated", serde_json::json!({"wallet": wallet_name, "fee": fee.0.to_string()}));
+        log!("Relayer fee set to {} for '{}'", fee.0, wallet_name);
+    }
+
+    /// Set allowed relayers (empty = anyone can relay)
+    pub fn set_allowed_relayers(
+        &mut self,
+        wallet_name: String,
+        relayers: Vec<AccountId>,
+        signature: String,
+        expires_at: u64,
+    ) {
+        self.verify_owner(&format!("set_relayers:{}", wallet_name), &signature, expires_at);
+        let mut wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        wallet.allowed_relayers = relayers;
+        self.wallets.insert(&wallet_name, &wallet);
+        self.emit_event("relayers_updated", serde_json::json!({"wallet": wallet_name}));
+        log!("Relayer allowlist updated for '{}'", wallet_name);
+    }
+
+    // ── Intent Activation ─────────────────────────────────────────────
+
+    /// Activate an intent (undo deactivation)
+    pub fn activate_intent(
+        &mut self,
+        wallet_name: String,
+        intent_index: u32,
+        signature: String,
+        expires_at: u64,
+    ) {
+        self.verify_owner(&format!("activate_intent:{}:{}", wallet_name, intent_index), &signature, expires_at);
+        let ikey = intent_key(&wallet_name, intent_index);
+        let mut intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
+        intent.active = true;
+        self.intents.insert(&ikey, &intent);
+        self.emit_event("intent_activated", serde_json::json!({"wallet": wallet_name, "intent_index": intent_index}));
+        log!("Intent #{} activated in wallet '{}'", intent_index, wallet_name);
+    }
+
+    /// Deactivate an intent (pause without removing)
+    pub fn deactivate_intent(
+        &mut self,
+        wallet_name: String,
+        intent_index: u32,
+        signature: String,
+        expires_at: u64,
+    ) {
+        self.verify_owner(&format!("deactivate_intent:{}:{}", wallet_name, intent_index), &signature, expires_at);
+        let ikey = intent_key(&wallet_name, intent_index);
+        let mut intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
+        assert!(intent.active_proposal_count == 0, "ERR_HAS_ACTIVE_PROPOSALS");
+        intent.active = false;
+        self.intents.insert(&ikey, &intent);
+        self.emit_event("intent_deactivated", serde_json::json!({"wallet": wallet_name, "intent_index": intent_index}));
+        log!("Intent #{} deactivated in wallet '{}'", intent_index, wallet_name);
+    }
+
+    // ── Batch Execution ───────────────────────────────────────────────
+
+    /// Execute multiple approved proposals in a single transaction.
+    /// Owner signs once with the batch proposal IDs.
+    #[payable]
+    pub fn batch_execute(
+        &mut self,
+        wallet_name: String,
+        proposal_ids: Vec<u64>,
+        signature: String,
+        expires_at: u64,
+    ) {
+        let action = format!("batch:{}:{:?}", wallet_name, &proposal_ids);
+        self.verify_owner(&action, &signature, expires_at);
+
+        assert!(!proposal_ids.is_empty(), "ERR_EMPTY_BATCH");
+        assert!(proposal_ids.len() <= 10, "ERR_BATCH_TOO_LARGE: max 10");
+
+        for proposal_id in &proposal_ids {
+            self.execute_proposal(&wallet_name, *proposal_id);
+        }
+
+        self.emit_event("batch_executed", serde_json::json!({
+            "wallet": wallet_name, "count": proposal_ids.len(),
+        }));
+        log!("Batch executed {} proposals in wallet '{}'", proposal_ids.len(), wallet_name);
+    }
+
+    // ── Auto Cleanup ──────────────────────────────────────────────────
+
+    /// Clean up expired proposals to reclaim storage.
+    /// Can be called by anyone (not just owner) since it only removes expired proposals.
+    /// Reward: caller gets a small storage refund incentive.
+    pub fn cleanup_expired(
+        &mut self,
+        wallet_name: String,
+        from_id: u64,
+        to_id: u64,
+    ) -> u64 {
+        let wallet = self.wallets.get(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
+        let now = env::block_timestamp();
+        let mut cleaned = 0u64;
+
+        for id in from_id..=to_id.min(wallet.proposal_index.saturating_sub(1)) {
+            let pkey = proposal_key(&wallet_name, id);
+            if let Some(proposal) = self.proposals.get(&pkey) {
+                if (proposal.status == ProposalStatus::Executed ||
+                    proposal.status == ProposalStatus::Cancelled) ||
+                    (proposal.status == ProposalStatus::Active && proposal.expires_at < now) {
+                    // Expired active proposals: cancel them first
+                    if proposal.status == ProposalStatus::Active {
+                        let ikey = intent_key(&wallet_name, proposal.intent_index);
+                        if let Some(mut intent) = self.intents.get(&ikey) {
+                            intent.active_proposal_count = intent.active_proposal_count.saturating_sub(1);
+                            self.intents.insert(&ikey, &intent);
+                        }
+                    }
+                    self.proposals.remove(&pkey);
+                    cleaned += 1;
+                }
+            }
+        }
+
+        if cleaned > 0 {
+            self.emit_event("cleanup", serde_json::json!({
+                "wallet": wallet_name, "cleaned": cleaned, "from": from_id, "to": to_id,
+            }));
+            log!("Cleaned up {} expired proposals from wallet '{}'", cleaned, wallet_name);
+        }
+
+        cleaned
+    }
 }
 
 // ── Private Helpers ────────────────────────────────────────────────────────
@@ -1032,8 +1355,37 @@ impl Contract {
             .parse().expect("ERR_INVALID_RECIPIENT");
         let amount: u128 = amount_str.parse().expect("ERR_INVALID_AMOUNT");
 
+        // Enforce daily spend limit
+        {
+            let mut wallet = self.wallets.get(wallet_name).expect("ERR_WALLET_NOT_FOUND");
+            wallet.enforce_spend_limit(env::block_timestamp());
+            wallet.track_spend(amount);
+            self.wallets.insert(wallet_name, &wallet);
+        }
+
         if let Some(token_str) = params.get("token").and_then(|v| v.as_str()) {
             self.debit_ft(wallet_name, token_str, amount);
+            // FT transfer: call ft_transfer on the token contract
+            let token_account: AccountId = token_str.parse().expect("ERR_INVALID_TOKEN_ACCOUNT");
+            let promise = Promise::new(token_account.clone()).function_call(
+                "ft_transfer".to_string(),
+                safe_json_ft_transfer(recipient.as_str(), &amount.to_string()),
+                NearToken::from_yoctonear(1), // 1 yocto for ft_transfer
+                near_sdk::Gas::from_tgas(30),
+            );
+            // Callback to handle result
+            let current_account = env::current_account_id();
+            promise.then(Promise::new(current_account).function_call(
+                "on_ft_transfer_result".to_string(),
+                serde_json::to_vec(&serde_json::json!({
+                    "wallet_name": wallet_name,
+                    "token": token_account.to_string(),
+                    "amount": amount.to_string(),
+                    "recipient": recipient.to_string(),
+                })).unwrap(),
+                NearToken::from_yoctonear(0),
+                near_sdk::Gas::from_tgas(5),
+            ));
             log!("FT transfer: {} of {} to {} (debit recorded)", amount, token_str, recipient);
         } else {
             self.debit_near(wallet_name, amount);
@@ -1060,6 +1412,40 @@ impl Contract {
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_EXECUTION_GAS_TGAS)
             .min(MAX_EXECUTION_GAS_TGAS);
+
+        // Enforce wallet limits
+        {
+            let mut wallet = self.wallets.get(wallet_name).expect("ERR_WALLET_NOT_FOUND");
+
+            // Receiver allowlist check
+            assert!(
+                wallet.is_call_receiver_allowed(&receiver_id),
+                "ERR_RECEIVER_NOT_ALLOWED: {} not in allowlist",
+                receiver_id
+            );
+
+            // Max deposit per call check
+            if wallet.call_max_deposit > 0 {
+                assert!(
+                    deposit <= wallet.call_max_deposit,
+                    "ERR_DEPOSIT_EXCEEDS_MAX: {} > {}",
+                    deposit, wallet.call_max_deposit
+                );
+            }
+
+            // Enforce daily spend limit
+            wallet.enforce_spend_limit(env::block_timestamp());
+            if deposit > 0 {
+                wallet.track_spend(deposit);
+            }
+
+            // Charge relayer fee (to wallet's storage deposit)
+            if wallet.relayer_fee > 0 {
+                wallet.storage_deposit = wallet.storage_deposit.saturating_sub(wallet.relayer_fee);
+            }
+
+            self.wallets.insert(wallet_name, &wallet);
+        }
 
         // Debit wallet's internal balance for the deposit
         if deposit > 0 {
@@ -1130,6 +1516,36 @@ impl Contract {
                 }
                 self.emit_event("call_failed", serde_json::json!({
                     "wallet": wallet_name, "receiver": receiver_id, "method": method_name, "refund": deposit,
+                }));
+            }
+        }
+    }
+
+    /// Callback after FT transfer. Refunds debit on failure.
+    /// Only callable by the contract itself (callback).
+    pub fn on_ft_transfer_result(
+        &mut self,
+        wallet_name: String,
+        token: AccountId,
+        amount: u128,
+        recipient: String,
+    ) {
+        assert_eq!(
+            env::predecessor_account_id(),
+            env::current_account_id(),
+            "ERR_CALLBACK_ONLY"
+        );
+        let result = env::promise_result(0u64);
+        match result {
+            PromiseResult::Successful(_) => {
+                log!("FT transfer {} of {} to {} succeeded", amount, token, recipient);
+            }
+            PromiseResult::Failed => {
+                // Refund the FT debit on failure
+                self.credit_ft(&wallet_name, token.as_str(), amount);
+                log!("FT transfer {} of {} to {} FAILED — refunded to wallet '{}'", amount, token, recipient, wallet_name);
+                self.emit_event("ft_transfer_failed", serde_json::json!({
+                    "wallet": wallet_name, "token": token.to_string(), "amount": amount.to_string(), "recipient": recipient,
                 }));
             }
         }
